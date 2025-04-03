@@ -6,7 +6,8 @@ from promptsource.templates import DatasetTemplates
 from promptsource.templates import TemplateCollection
 
 
-ALL_DATASET_IDS = ['ag_news']
+T0_HELDOUT_TASKS = ['copa', 'hellaswag', 'story_cloze', 'anli', 'cb', 'rte', 'wsc', 'winogrande', 'wic']
+# TODO: compared to T0 eval, our heldout tasks are missing bigbench coming from other source
 
 
 class PromptLoader:
@@ -14,10 +15,13 @@ class PromptLoader:
     def __init__(self):
         self.collection = TemplateCollection()
 
-
     def iterate_prompts(self, split: str = "train") -> Iterator[Tuple[str, str]]:
         for dataset_ids, templates in self.collection.datasets_templates.items():
             dataset_id, subset = dataset_ids
+            if split == "train" and dataset_id in T0_HELDOUT_TASKS:
+                continue
+            elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
+                continue
             dataset = load_dataset(dataset_id, subset, split=split, trust_remote_code=True)
             for sample in dataset:
                 inputs, labels = [], []
