@@ -13,9 +13,7 @@ class TrainingArgs:
     Argument class for use with simple_parsing that handles the basics of most LLM training scripts. Subclass this to add more arguments.
     """
 
-    data_dir: Path = field(alias="-d")
-
-    hf_model_name: str = field(default="roberta-base", alias="--model")
+    hf_model_name: str = field(default="meta-llama/Llama-3.2-1B", alias="--model") #openai-community/gpt2
     "HuggingFace model identifier. This is used to construct the model architecture and load pretrained weights if not specified otherwise."
 
     from_scratch: bool = field(default=False)
@@ -94,7 +92,7 @@ class TrainingArgs:
     """If None, use batch_size // num_devices. This is the batch size per device, not the total batch size.
     You should tune this so that you do not get GPU RAM OOM errors. We automatically calculate the gradient accumulation steps to achieve your desired `batch_size`."""
 
-    eval_micro_batch_size: int = field(default=None)
+    eval_micro_batch_size: int = field(default=None, alias="--emb")
     "If None, use micro_batch_size."
 
     gradient_accumulation_steps: int = field(default=-1)
@@ -119,7 +117,7 @@ class TrainingArgs:
     run_name: str = field(default=None, alias="-n")
     "Run name for logging."
 
-    seed: int | None = field(default=None)
+    seed: int | None = field(default=42)
 
     only_val: bool = field(default=False)
     "Only run validation."

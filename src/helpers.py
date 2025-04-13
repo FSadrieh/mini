@@ -72,9 +72,10 @@ class ProgressMetricCallback(Callback):
 
     @rank_zero_only
     def on_train_batch_end(self, trainer: Trainer, pl_module: Any, outputs: STEP_OUTPUT, batch: Any, batch_idx: int) -> None:
-        B, T = batch["input_ids"].shape
-        self.samples_processed += B * trainer.num_devices
-        self.tokens_processed += B * T * trainer.num_devices
+        N = len(batch["input_ids"])
+        B, T = batch["input_ids"][0].shape
+        self.samples_processed += N * B * trainer.num_devices
+        self.tokens_processed += N * B * T * trainer.num_devices
 
         self.log_dict(
             {

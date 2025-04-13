@@ -22,8 +22,8 @@ from src.helpers import (
 )
 from src.model import BasicLM
 
-WANDB_PROJECT = "nlp-research-template"
-WANDB_ENTITY = "konstantinjdobler"
+WANDB_PROJECT = "mini"
+WANDB_ENTITY = "frederic_sadrieh"
 
 
 def main(args: TrainingArgs):

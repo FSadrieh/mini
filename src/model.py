@@ -3,10 +3,11 @@ from typing import Literal
 import lightning as L
 from print_on_steroids import logger
 from torch.optim import AdamW
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto.configuration_auto import AutoConfig
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM, AutoModelForMaskedLM
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.optimization import get_scheduler
+
+import torch
 
 
 class BasicLM(L.LightningModule):
@@ -30,18 +31,7 @@ class BasicLM(L.LightningModule):
             self.save_hyperparameters(ignore=["save_hyperparameters"])
         config = AutoConfig.from_pretrained(model_name_or_path, return_dict=True)
 
-        if lm_objective == "mlm":
-            self.model: PreTrainedModel = (
-                AutoModelForMaskedLM.from_pretrained(model_name_or_path, config=config)
-                if not from_scratch
-                else AutoModelForMaskedLM.from_config(config=config)
-            )
-        elif lm_objective == "clm":
-            self.model: PreTrainedModel = (
-                AutoModelForCausalLM.from_pretrained(model_name_or_path, config=config)
-                if not from_scratch
-                else AutoModelForCausalLM.from_config(config=config)
-            )
+        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, config=config)
 
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -52,17 +42,41 @@ class BasicLM(L.LightningModule):
         self.eval_interval = eval_interval
         self.epsilon = epsilon
 
-    def forward(self, x):
-        return self.model(x).logits
+        # if self.freeze > 0:
+        #     logger.info(f"Freezing {self.freeze} layers of the model")
+        #     for param in self.model.parameters():
+        #         param.requires_grad = False
+        #     for i, layer in enumerate(self.model.encoder.layer):
+        #         if i >= self.freeze:
+        #             break
+        #         for param in layer.parameters():
+        #             param.requires_grad = True
+
+    def forward(self, input_ids, attention_masks, labels):
+        return [
+            self.model(
+                input_ids=input_id,
+                attention_mask=attention_mask,
+                labels=label,
+            )
+            for input_id, attention_mask, label in zip(input_ids, attention_masks, labels)
+        ]
 
     def training_step(self, batch, batch_idx):
-        loss = self.model(**batch).loss
+        outputs = self(**batch)
+        loss = torch.stack([output.loss for output in outputs]).mean()
         self.log("train/loss", loss, on_step=True, on_epoch=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self.model(**batch).loss
+        outputs = self(**batch)
+        losses = torch.stack([output.loss for output in outputs])
+        loss = torch.mean(losses)
+        loss_distance = torch.abs(max(losses) - min(losses))
+        loos_var = torch.var(losses)
         self.log("val/loss", loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_distance", loss_distance, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/loss_var", loos_var, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
         if self.global_rank == 0:
