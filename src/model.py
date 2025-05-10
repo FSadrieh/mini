@@ -6,6 +6,7 @@ from torch.optim import AdamW
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.optimization import get_scheduler
+from torch.nn import CrossEntropyLoss
 
 import torch
 
@@ -13,34 +14,16 @@ import torch
 class BasicLM(L.LightningModule):
     def __init__(
         self,
-        model_name_or_path: str,
-        lm_objective: Literal["mlm", "clm"],
-        from_scratch: bool,
-        learning_rate: float,
-        weight_decay: float,
-        beta1: float,
-        beta2: float,
-        lr_schedule: str,
-        warmup_period: int,
-        eval_interval: int,
-        epsilon: float = 1e-8,
+        args,
         save_hyperparameters: bool = True,
     ) -> None:
         super().__init__()
         if save_hyperparameters:
             self.save_hyperparameters(ignore=["save_hyperparameters"])
-        config = AutoConfig.from_pretrained(model_name_or_path, return_dict=True)
-
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, config=config)
-
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.lr_schedule = lr_schedule
-        self.warmup_period = warmup_period
-        self.eval_interval = eval_interval
-        self.epsilon = epsilon
+        self.args = args
+        config = AutoConfig.from_pretrained(args.hf_model_name, return_dict=True)
+        self.model = AutoModelForCausalLM.from_pretrained(args.hf_model_name, config=config)
+        self.loss = CrossEntropyLoss(ignore_index=-100, reduction='none')
 
         # if self.freeze > 0:
         #     logger.info(f"Freezing {self.freeze} layers of the model")
@@ -52,36 +35,53 @@ class BasicLM(L.LightningModule):
         #         for param in layer.parameters():
         #             param.requires_grad = True
 
-    def forward(self, input_ids, attention_masks, labels):
-        return [
-            self.model(
-                input_ids=input_id,
-                attention_mask=attention_mask,
-                labels=label,
-            )
-            for input_id, attention_mask, label in zip(input_ids, attention_masks, labels)
-        ]
+    def forward(self, input_ids, attention_masks, labels, sample_count):
+        return self.model(
+            input_ids=input_ids,
+            attention_mask=attention_masks,
+        )
 
     def training_step(self, batch, batch_idx):
-        outputs = self(**batch)
-        loss = torch.stack([output.loss for output in outputs]).mean()
-        self.log("train/loss", loss, on_step=True, on_epoch=False)
+        output = self(**batch)
+        loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
+        loss = loss[self.args.loss_type]
+        self.log("train/loss", loss, on_step=True, on_epoch=False, batch_size=batch["input_ids"].shape[0])
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self(**batch)
-        losses = torch.stack([output.loss for output in outputs])
-        loss = torch.mean(losses)
-        loss_distance = torch.abs(max(losses) - min(losses))
-        loos_var = torch.var(losses)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val/loss_distance", loss_distance, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("val/loss_var", loos_var, on_step=False, on_epoch=True, sync_dist=True)
+        output = self(**batch)
+        loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
+        self.log_dict(
+            {
+                "val/sum_loss": loss["sum"],
+                "val/distance_loss": loss["distance"],
+                "val/var_loss": loss["variance"],
+            },
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch["input_ids"].shape[0],
+        )
+
+    def calculate_loss(self, logits, labels, sample_count):
+        labels = labels[:, 1:].contiguous()
+        logits = logits[:, :-1, :].contiguous()
+        per_token_loss = self.loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+        per_token_loss = per_token_loss.view(labels.size(0), labels.size(1))
+        per_example_loss = per_token_loss.sum(dim=1) / labels.ne(-100).sum(dim=1).float()
+        per_group_loss = torch.split(per_example_loss, sample_count)
+        return {
+            "distance": sum(torch.abs(max(losses) - min(losses)) for losses in per_group_loss) / len(per_group_loss),
+            "variance": sum(torch.var(losses) for losses in per_group_loss) / len(per_group_loss),
+            "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
+        }
+
+
 
     def configure_optimizers(self):
         if self.global_rank == 0:
             logger.info(
-                f"Using lr: {self.learning_rate}, weight decay: {self.weight_decay} and warmup steps: {self.warmup_period}"
+                f"Using lr: {self.args.learning_rate}, weight decay: {self.args.weight_decay} and warmup steps: {self.args.warmup_period}"
             )
 
         named_parameters = list(self.model.named_parameters())
@@ -94,7 +94,7 @@ class BasicLM(L.LightningModule):
         optimizer_parameters = [
             {
                 "params": [p for n, p in optimized_named_parameters if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.weight_decay,
+                "weight_decay": self.args.weight_decay,
             },
             {
                 "params": [p for n, p in optimized_named_parameters if any(nd in n for nd in no_decay)],
@@ -103,18 +103,18 @@ class BasicLM(L.LightningModule):
         ]
         optimizer = AdamW(
             optimizer_parameters,
-            self.learning_rate,
-            betas=(self.beta1, self.beta2),
-            eps=self.epsilon,  # You can also tune this
+            self.args.learning_rate,
+            betas=(self.args.beta1, self.args.beta2),
+            eps=self.args.epsilon,  # You can also tune this
         )
 
-        scheduler_name = self.lr_schedule
-        if scheduler_name == "constant" and self.warmup_period > 0:
+        scheduler_name = self.args.lr_schedule
+        if scheduler_name == "constant" and self.args.warmup_period > 0:
             scheduler_name += "_with_warmup"
         scheduler = get_scheduler(
             scheduler_name,
             optimizer,
-            num_warmup_steps=int(self.warmup_period),
+            num_warmup_steps=int(self.args.warmup_period),
             num_training_steps=self.trainer.max_steps,
         )
 

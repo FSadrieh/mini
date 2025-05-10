@@ -23,7 +23,7 @@ from src.helpers import (
 from src.model import BasicLM
 
 WANDB_PROJECT = "mini"
-WANDB_ENTITY = "frederic_sadrieh"
+WANDB_ENTITY = "transformersclub"
 
 
 def main(args: TrainingArgs):
@@ -78,18 +78,6 @@ def main(args: TrainingArgs):
     ################# Construct model ##############
 
     # Resume from checkpoint if specified
-    model_args = dict(
-        model_name_or_path=args.hf_model_name,
-        lm_objective=args.language_modeling_objective,
-        from_scratch=args.from_scratch,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        lr_schedule=args.lr_schedule,
-        warmup_period=args.warmup_period,
-        eval_interval=args.eval_interval,
-    )
     if args.saved_checkpoint_path:
         args.saved_checkpoint_path = check_for_wandb_checkpoint_and_download_if_necessary(
             args.saved_checkpoint_path, wandb_logger.experiment
@@ -99,11 +87,11 @@ def main(args: TrainingArgs):
             model = BasicLM.load_from_checkpoint(args.saved_checkpoint_path, save_hyperparameters=False)
             # we will resume via trainer.fit(ckpt_path=...)
         else:  # load only weights
-            model = BasicLM(**model_args)
+            model = BasicLM(args)
             torch_load = torch.load(args.saved_checkpoint_path, map_location=torch.device("cpu"))
             model.load_state_dict(torch_load["state_dict"], strict=False)
     else:
-        model = BasicLM(**model_args)
+        model = BasicLM(args)
 
     tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(args.tokenizer_path or args.hf_model_name, use_fast=True)
     if not args.resume:

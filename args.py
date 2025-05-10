@@ -1,7 +1,6 @@
 import multiprocessing
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from simple_parsing import field, list_field
@@ -70,6 +69,7 @@ class TrainingArgs:
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
+    epsilon: float = 1e-8
     grad_clip: float = field(default=1.0)
     "If -1, disable."
 
@@ -125,7 +125,7 @@ class TrainingArgs:
     val_before_training: bool = field(default=True)
     "Run one validation epoch before training."
 
-    out_dir: Path = field(default="out/")
+    out_dir: str = field(default="out/")
 
     wandb_tags: list[str] = list_field(default=[], alias="-t")
     "Tags for wandb."
@@ -141,6 +141,23 @@ class TrainingArgs:
 
     fast_dev_run: bool = field(default=False)
     "Do fast run through training and validation with reduced sizes."
+
+    ############################
+    ###### mini Specific #######
+    ############################
+
+    firstn_datasets: int = field(default=0)
+    "Number of datasets to use for training. If 0, use all datasets."
+
+    data_location: str = field(default="data")
+    "Location of the datasets. If None, use the current directory."
+
+    drop_last_batch: bool = field(default=True)
+
+    loss_type: Literal["distance", "variance", "sum"] = field(default="distance")
+    "Type of loss to use. distance: max - min, variance: var, sum: sum of losses."
+
+
 
     def __post_init__(self):
         assert self.num_devices > 0
