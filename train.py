@@ -116,14 +116,14 @@ def main(args: TrainingArgs):
     dm = LMDataModule(training_args=args, tokenizer=tokenizer)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     wandb_disk_cleanup_callback = WandbCleanupDiskAndCloudSpaceCallback(cleanup_local=True, cleanup_online=False, size_limit=20)
-    checkpoint_callback = ModelCheckpoint(
-        filename="snap-{step}-samples-{progress/samples}-{progress/tokens}-loss-{val/loss:.2f}",
-        monitor="val/loss",
-        mode="min",
-        auto_insert_metric_name=False,
-        every_n_train_steps=int(args.save_interval),
-    )
-    callbacks = [checkpoint_callback, wandb_disk_cleanup_callback, lr_monitor, ProgressMetricCallback()]
+    # checkpoint_callback = ModelCheckpoint(
+    #     filename="snap-{step}-samples-{progress/samples}-{progress/tokens}-loss-{val/sum_loss:.2f}",
+    #     monitor="val/sum_loss",
+    #     mode="min",
+    #     auto_insert_metric_name=False,
+    #     every_n_train_steps=int(args.save_interval),
+    # )
+    callbacks = [wandb_disk_cleanup_callback, lr_monitor, ProgressMetricCallback()]
     if args.accelerator == "cuda":
         callbacks.append(CUDAMetricsCallback())
 
@@ -191,16 +191,16 @@ def main(args: TrainingArgs):
         if current_process_rank == 0:
             logger.info("Trying to save checkpoint....")
 
-            save_path = str(Path(checkpoint_callback.dirpath) / "last_model_ckpt.ckpt")
-            trainer.save_checkpoint(save_path)
+            # save_path = str(Path(checkpoint_callback.dirpath) / "last_model_ckpt.ckpt")
+            # trainer.save_checkpoint(save_path)
 
-            logger.info("Collecting PL checkpoint for wandb...")
-            artifact = wandb.Artifact(name=f"model-{wandb_logger.experiment.id}", type="model")
-            artifact.add_file(save_path, name="model.ckpt")
+            # logger.info("Collecting PL checkpoint for wandb...")
+            # artifact = wandb.Artifact(name=f"model-{wandb_logger.experiment.id}", type="model")
+            # artifact.add_file(save_path, name="model.ckpt")
 
-            logger.info("Pushing to wandb...")
-            aliases = ["train_end", "latest"]
-            wandb_logger.experiment.log_artifact(artifact, aliases=aliases)
+            # logger.info("Pushing to wandb...")
+            # aliases = ["train_end", "latest"]
+            # wandb_logger.experiment.log_artifact(artifact, aliases=aliases)
 
             logger.success("Saving finished!")
 

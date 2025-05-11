@@ -7,7 +7,7 @@ from typing import Iterator, Tuple
 from torch.utils import data
 import torch
 
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, load_from_disk
 from promptsource.templates import DatasetTemplates
 from promptsource.templates import TemplateCollection
 
@@ -232,7 +232,7 @@ class PromptLoader:
         self.seed = seed
         self.tokenized_data_path = tokenized_data_path
 
-    def iterate_prompts_new(self, split: str = "train") -> Iterator[Tuple[str, str]]:
+    def iterate_prompts(self, split: str = "train") -> Iterator[Tuple[str, str]]:
         datasets_iterator = self.collection.datasets_templates.items()
         if self.firstn_datasets:
             print("Limiting the iterated datasets to first %s ones" % self.firstn_datasets)
@@ -275,76 +275,6 @@ class PromptLoader:
                 dataset.save_to_disk(dataset_path)
                 dataset_list.append(dataset)
 
-        full_dataset = datasets.concatenate_datasets(dataset_list)
-        full_dataset = full_dataset.shuffle(seed=self.seed)
-        full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))
-        return full_dataset
-
-    def iterate_prompts(self, split: str = "train") -> Iterator[Tuple[str, str]]:
-        datasets_iterator = self.collection.datasets_templates.items()
-        # if self.firstn_datasets:
-        #     print("Limiting the iterated datasets to first %s ones" % self.firstn_datasets)
-        #     datasets_iterator = itertools.islice(self.collection.datasets_templates.items(), self.firstn_datasets)
-
-        sample_inputs = []
-        sample_labels = []
-        dataset_list = []
-        doesnt_work = []
-        for dataset_ids, templates in tqdm(datasets_iterator, desc="Iterating over datasets"):
-            dataset_id, subset = dataset_ids
-            #TODO: DEBUG
-            counter = 0
-            breaker = False
-            dataset_list.append(dataset_id)
-            if dataset_id in ["tydiqa", "duorc", "multi_news", "amazon_us_reviews", "gigaword", "amazon_reviews_multi"]:
-                logger.info(f"Skipping {dataset_id} dataset, because Problems with it.")
-                continue
-            try:
-                logger.info(f"Processing {dataset_id}...")
-                dataset = Dataset.load_from_disk(self.tokenized_data_path + f"/{dataset_id}" + f"/{subset}/")
-                logger.info(f"Loaded {dataset_id} dataset from disk.")
-                dataset_list.append(dataset)
-            except OSError as e:
-                if split == "train" and dataset_id in T0_HELDOUT_TASKS:
-                    continue
-                elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
-                    continue
-                try:
-                    dataset = load_dataset(dataset_id, subset, split=split, trust_remote_code=True)
-                except (ValueError, TypeError) as e:
-                    try:
-                        dataset = load_dataset(dataset_id, subset, split=split)
-                    except Exception as e:
-                        logger.info(f"Dataset {dataset_id} not found. Skipping...")
-                        doesnt_work.append((dataset_id, subset))
-                        continue
-                for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
-                    inputs, labels = [], []
-                    for template_id, template in templates.templates.items():
-                        try:
-                            input_prompt, label = template.apply(sample)
-                        except Exception as e:
-                            doesnt_work.append((dataset_id, subset))
-                            logger.info(f"Template {template_id} for dataset {dataset_id} does not work: {e}")
-                            breaker = True
-                            break
-                    if counter > 100:
-                        break
-                    counter += 1
-                    if breaker:
-                        break
-                        # inputs.append(input_prompt)
-                        # labels.append(label)
-
-                    # sample_inputs.append(self.tokenizer(inputs, padding=False)["input_ids"])
-                    # sample_labels.append(self.tokenizer(labels, padding=False, add_special_tokens=False)["input_ids"])
-                # dataset = Dataset.from_dict({"inputs": sample_inputs, "labels": sample_labels})
-                # dataset.save_to_disk(os.path.join(self.tokenized_data_path, dataset_id, subset))
-                # dataset_list.append(dataset)
-
-        print(dataset_list)
-        print(doesnt_work)
-        exit()
         full_dataset = datasets.concatenate_datasets(dataset_list)
         full_dataset = full_dataset.shuffle(seed=self.seed)
         full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))

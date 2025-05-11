@@ -39,20 +39,34 @@ class BasicLM(L.LightningModule):
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_masks,
+            labels=labels,
         )
 
     def training_step(self, batch, batch_idx):
         output = self(**batch)
-        loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
-        loss = loss[self.args.loss_type]
-        self.log("train/loss", loss, on_step=True, on_epoch=False, batch_size=batch["input_ids"].shape[0])
-        return loss
+        custom_loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
+        self.log_dict(
+            {
+                "train/loss": output.loss,
+                "train/mean_loss": custom_loss["mean"],
+                "train/sum_loss": custom_loss["sum"],
+                "train/distance_loss": custom_loss["distance"],
+                "train/var_loss": custom_loss["variance"],
+            },
+            on_step=True,
+            on_epoch=False,
+            batch_size=batch["input_ids"].shape[0],
+            sync_dist=True,
+        )
+        return output.loss
 
     def validation_step(self, batch, batch_idx):
         output = self(**batch)
         loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
         self.log_dict(
             {
+                "val/loss": output.loss,
+                "val/mean_loss": loss["mean"],
                 "val/sum_loss": loss["sum"],
                 "val/distance_loss": loss["distance"],
                 "val/var_loss": loss["variance"],
@@ -67,6 +81,7 @@ class BasicLM(L.LightningModule):
         labels = labels[:, 1:].contiguous()
         logits = logits[:, :-1, :].contiguous()
         per_token_loss = self.loss(logits.view(-1, logits.size(-1)), labels.view(-1))
+        total_mean_loss = per_token_loss.sum() / labels.ne(-100).sum().float()
         per_token_loss = per_token_loss.view(labels.size(0), labels.size(1))
         per_example_loss = per_token_loss.sum(dim=1) / labels.ne(-100).sum(dim=1).float()
         per_group_loss = torch.split(per_example_loss, sample_count)
@@ -74,6 +89,7 @@ class BasicLM(L.LightningModule):
             "distance": sum(torch.abs(max(losses) - min(losses)) for losses in per_group_loss) / len(per_group_loss),
             "variance": sum(torch.var(losses) for losses in per_group_loss) / len(per_group_loss),
             "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
+            "mean": total_mean_loss,
         }
 
 

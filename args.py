@@ -154,7 +154,7 @@ class TrainingArgs:
 
     drop_last_batch: bool = field(default=True)
 
-    loss_type: Literal["distance", "variance", "sum"] = field(default="distance")
+    loss_type: Literal["distance", "variance", "sum", "mean"] = field(default="distance")
     "Type of loss to use. distance: max - min, variance: var, sum: sum of losses."
 
 
