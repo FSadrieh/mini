@@ -72,7 +72,7 @@ class LMDataModule(L.LightningDataModule):
     def load_dataset(self, splits) -> None:
         data_files_dict = {}
         for split in splits:
-            logger.info("loading from datasets file")
+            logger.info("loading from datasets file", self.processed_data_path(split))
             # gather all data files in a dict if file ends in .arrow
             data_files_dict[split] = [
                 os.path.join(self.processed_data_path(split), file)
@@ -164,18 +164,18 @@ def make_tokenize_function(tokenizer: PreTrainedTokenizerFast):
         }
     return tokenize_function
 
-def make_preprocess_function(batch_size:int, tokenizer: PreTrainedTokenizerFast):
+def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast):
     def preprocess_function(examples):
         batches = []
         batch_input_ids = []
         batch_lengths = []
         batch_counter = []
         try:
-            input_ids = examples["input_ids"]
+            input_ids_list = examples["input_ids"]
         except KeyError as e:
-            input_ids = examples["inputs"]
+            input_ids_list = examples["inputs"]
         # TODO: Change again to input_ids
-        for input_ids, labels in zip(input_ids, examples["labels"]):
+        for input_ids, labels in zip(input_ids_list, examples["labels"]):
             # If we have more examples for a give input than micro batch size we can not leave them in one batch
             if len(input_ids) > batch_size:
                 logger.error(f"Examples per sample {len(input_ids)} is greater than micro batch size {batch_size}.")
@@ -191,14 +191,12 @@ def make_preprocess_function(batch_size:int, tokenizer: PreTrainedTokenizerFast)
                 # The labels are -100 for the input ids and the padding tokens only the labels are kept
                 label = input_ids_tensor.clone()
                 mask = torch.arange(max_len).unsqueeze(0) >= torch.tensor(batch_lengths).unsqueeze(1)
-                masked_label = -100 * ~mask + label * mask
+                masked_label = torch.where(mask, label, torch.full_like(label, -100))
                 masked_label[masked_label == tokenizer.pad_token_id] = -100
-                #TODO: What happens to the eos token it will also be masked
-                attention_mask = torch.where(
-                    input_ids_tensor != tokenizer.pad_token_id,
-                    torch.tensor(1),
-                    torch.tensor(0),
-                )
+                attention_mask = (input_ids_tensor != tokenizer.pad_token_id).long()
+                # Replace the -1 with the eos_token_id
+                input_ids_tensor[input_ids_tensor == -1] = tokenizer.eos_token_id
+                masked_label[masked_label == -1] = tokenizer.eos_token_id
                 batches.append(
                     {
                         "input_ids": input_ids_tensor,
@@ -213,7 +211,8 @@ def make_preprocess_function(batch_size:int, tokenizer: PreTrainedTokenizerFast)
 
             for example_input_ids, example_labels in zip(input_ids, labels):
                 # We append each example to the batch and store from which sample it comes from
-                batch_input_ids.append(torch.tensor(example_input_ids + example_labels + [tokenizer.eos_token_id]))
+                # The -1 is a placeholder for the end of sentence token which should not be masked
+                batch_input_ids.append(torch.tensor(example_input_ids + example_labels + [-1]))
                 batch_lengths.append(torch.tensor(len(example_input_ids)))
 
             batch_counter.append(len(input_ids))

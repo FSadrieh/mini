@@ -36,6 +36,10 @@ class BasicLM(L.LightningModule):
         #             param.requires_grad = True
 
     def forward(self, input_ids, attention_masks, labels, sample_count):
+        input_check = torch.where(labels == -100, -100, labels)
+        assert torch.all(labels == input_check), f"input_ids and labels do not match: {input_ids} != {input_check}"
+        # Shift labels to the right
+        labels = torch.cat((torch.ones_like(labels[:, 0]).unsqueeze(1) * -100, labels[:, :-1]), dim=1)
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_masks,

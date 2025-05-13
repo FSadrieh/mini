@@ -54,7 +54,7 @@ def main(args: TrainingArgs):
     wandb_logger = WandbLogger(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
-        log_model="all",
+        log_model=False,
         tags=args.wandb_tags,
         save_dir="logs/",
         **wandb_extra_args,
