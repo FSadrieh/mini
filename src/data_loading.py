@@ -79,10 +79,7 @@ class LMDataModule(L.LightningDataModule):
                 for file in os.listdir(self.processed_data_path(split))
                 if file.endswith(".arrow")
             ]
-        self.dataset_per_split = load_dataset("arrow", data_files=data_files_dict, streaming=True).with_format("torch")
-        for split in splits:
-            self.dataset_per_split[split].batch_size = 1
-            self.dataset_per_split[split].drop_last_batch = self.args.drop_last_batch
+        self.dataset_per_split = load_dataset("arrow", data_files=data_files_dict).with_format("torch")
 
         logger.info("Loaded dataset...")
 
@@ -118,7 +115,7 @@ class LMDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         common_args = dict(
-            batch_size=None,
+            batch_size=1,
             num_workers=self.args.workers,
             persistent_workers=(
                 True if self.args.workers > 0 else False
@@ -130,7 +127,7 @@ class LMDataModule(L.LightningDataModule):
 
     def val_dataloader(self):
         common_args = dict(
-            batch_size=None,
+            batch_size=1,
             num_workers=self.args.workers,
             persistent_workers=(
                 True if self.args.workers > 0 else False
@@ -243,8 +240,8 @@ class PromptLoader:
         for dataset_ids, templates in tqdm(datasets_iterator, desc="Iterating over datasets"):
             dataset_id, subset = dataset_ids
             dataset_path = os.path.join(self.tokenized_data_path, dataset_id, subset) if subset else os.path.join(self.tokenized_data_path, dataset_id)
-            #TODO: DEBUG
-            if dataset_id in ["tydiqa", "duorc", "multi_news"]:
+            #TODO: DEBUG we only want a few datatsets for now
+            if dataset_id not in ["blbooksgenre", "hellaswag", "newspop", "samsum", "winogrande", "wiqa"]:
                 logger.info(f"Skipping {dataset_id} dataset, because Problems with it.")
                 continue
             if split == "train" and dataset_id in T0_HELDOUT_TASKS:

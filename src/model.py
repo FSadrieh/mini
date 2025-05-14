@@ -9,6 +9,7 @@ from transformers.optimization import get_scheduler
 from torch.nn import CrossEntropyLoss
 
 import torch
+import wandb
 
 
 class BasicLM(L.LightningModule):
@@ -22,8 +23,13 @@ class BasicLM(L.LightningModule):
             self.save_hyperparameters(ignore=["save_hyperparameters"])
         self.args = args
         config = AutoConfig.from_pretrained(args.hf_model_name, return_dict=True)
+        config.attn_implementation="flash_attention_2"
         self.model = AutoModelForCausalLM.from_pretrained(args.hf_model_name, config=config)
         self.loss = CrossEntropyLoss(ignore_index=-100, reduction='none')
+
+        self.prediction_table = wandb.Table(
+            columns=["time_step", "labels", "predictions"],
+        )
 
         # if self.freeze > 0:
         #     logger.info(f"Freezing {self.freeze} layers of the model")
@@ -39,7 +45,7 @@ class BasicLM(L.LightningModule):
         input_check = torch.where(labels == -100, -100, labels)
         assert torch.all(labels == input_check), f"input_ids and labels do not match: {input_ids} != {input_check}"
         # Shift labels to the right
-        labels = torch.cat((torch.ones_like(labels[:, 0]).unsqueeze(1) * -100, labels[:, :-1]), dim=1)
+        labels = torch.cat((labels[:, 1:], torch.ones_like(labels[:, 0]).unsqueeze(1) * -100), dim=1)
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_masks,
@@ -67,6 +73,10 @@ class BasicLM(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         output = self(**batch)
         loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
+        pred = torch.argmax(output.logits[0, :-1, :].contiguous(), dim=-1)
+        labels = batch["labels"][0][1:]
+        pred = pred[labels != -100]
+        label = labels[labels != -100]
         self.log_dict(
             {
                 "val/loss": output.loss,
@@ -80,6 +90,15 @@ class BasicLM(L.LightningModule):
             sync_dist=True,
             batch_size=batch["input_ids"].shape[0],
         )
+        if batch_idx == 0:
+            self.prediction_table.add_data(
+                self.global_step,
+                label,
+                pred,
+            )
+
+    def on_validation_epoch_end(self):
+        self.log("val/predictions", self.prediction_table)
 
     def calculate_loss(self, logits, labels, sample_count):
         labels = labels[:, 1:].contiguous()
