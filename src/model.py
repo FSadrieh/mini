@@ -27,9 +27,6 @@ class BasicLM(L.LightningModule):
         self.model = AutoModelForCausalLM.from_pretrained(args.hf_model_name, config=config)
         self.loss = CrossEntropyLoss(ignore_index=-100, reduction='none')
 
-        self.prediction_table = wandb.Table(
-            columns=["time_step", "labels", "predictions"],
-        )
 
         # if self.freeze > 0:
         #     logger.info(f"Freezing {self.freeze} layers of the model")
@@ -90,15 +87,6 @@ class BasicLM(L.LightningModule):
             sync_dist=True,
             batch_size=batch["input_ids"].shape[0],
         )
-        if batch_idx == 0:
-            self.prediction_table.add_data(
-                self.global_step,
-                label,
-                pred,
-            )
-
-    def on_validation_epoch_end(self):
-        self.log("val/predictions", self.prediction_table)
 
     def calculate_loss(self, logits, labels, sample_count):
         labels = labels[:, 1:].contiguous()
