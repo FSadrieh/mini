@@ -138,10 +138,10 @@ class LMDataModule(L.LightningDataModule):
 
     def collate(self, examples):
         return {
-            "input_ids": examples["batches"]["input_ids"],
-            "labels": examples["batches"]["labels"],
-            "attention_masks": examples["batches"]["attention_masks"],
-            "sample_count": examples["batches"]["sample_count"].tolist(),
+            "input_ids": examples[0]["batches"]["input_ids"],
+            "labels": examples[0]["batches"]["labels"],
+            "attention_masks": examples[0]["batches"]["attention_masks"],
+            "sample_count": examples[0]["batches"]["sample_count"].tolist(),
         }
 
 

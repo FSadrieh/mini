@@ -21,6 +21,7 @@ from src.helpers import (
     check_for_wandb_checkpoint_and_download_if_necessary,
 )
 from src.model import BasicLM
+import yaml
 
 WANDB_PROJECT = "mini"
 WANDB_ENTITY = "transformersclub"
@@ -76,7 +77,8 @@ def main(args: TrainingArgs):
         log_slurm_info()
 
     ################# Construct model ##############
-
+    tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(args.tokenizer_path or args.hf_model_name, use_fast=True)
+    generation_config = yaml.safe_load(open(args.generation_config_path, "r")) if args.generate_in_validation else None
     # Resume from checkpoint if specified
     if args.saved_checkpoint_path:
         args.saved_checkpoint_path = check_for_wandb_checkpoint_and_download_if_necessary(
@@ -87,13 +89,12 @@ def main(args: TrainingArgs):
             model = BasicLM.load_from_checkpoint(args.saved_checkpoint_path, save_hyperparameters=False)
             # we will resume via trainer.fit(ckpt_path=...)
         else:  # load only weights
-            model = BasicLM(args)
+            model = BasicLM(args, tokenizer, generation_config)
             torch_load = torch.load(args.saved_checkpoint_path, map_location=torch.device("cpu"))
             model.load_state_dict(torch_load["state_dict"], strict=False)
     else:
-        model = BasicLM(args)
+        model = BasicLM(args, tokenizer, generation_config)
 
-    tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(args.tokenizer_path or args.hf_model_name, use_fast=True)
     if not args.resume:
         pretrained_vocab_size = model.model.get_input_embeddings().weight.shape[0]
         if len(tokenizer) != pretrained_vocab_size:

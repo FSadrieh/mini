@@ -157,6 +157,12 @@ class TrainingArgs:
     loss_type: Literal["distance", "variance", "sum", "mean"] = field(default="distance")
     "Type of loss to use. distance: max - min, variance: var, sum: sum of losses."
 
+    generate_in_validation: bool = field(default=True)
+    "Generate samples during validation."
+
+    generation_config_path: str | None = field(default="cfgs/generation_cfg.yml")
+    "Path to a generation config file. If None, use the default generation config."
+
 
 
     def __post_init__(self):

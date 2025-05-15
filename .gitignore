@@ -140,3 +140,4 @@ dmypy.json
 
 # everything that has to do with run-results
 /template
+hf_test
