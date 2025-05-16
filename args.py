@@ -12,7 +12,7 @@ class TrainingArgs:
     Argument class for use with simple_parsing that handles the basics of most LLM training scripts. Subclass this to add more arguments.
     """
 
-    hf_model_name: str = field(default="meta-llama/Llama-3.2-1B", alias="--model") #openai-community/gpt2
+    hf_model_name: str = field(default="meta-llama/Llama-3.2-1B", alias="--model")  # openai-community/gpt2
     "HuggingFace model identifier. This is used to construct the model architecture and load pretrained weights if not specified otherwise."
 
     from_scratch: bool = field(default=False)
@@ -162,8 +162,6 @@ class TrainingArgs:
 
     generation_config_path: str | None = field(default="cfgs/generation_cfg.yml")
     "Path to a generation config file. If None, use the default generation config."
-
-
 
     def __post_init__(self):
         assert self.num_devices > 0

@@ -6,10 +6,10 @@ from torch.optim import AdamW
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.optimization import get_scheduler
-from transformers import AutoTokenizer
 from torch.nn import CrossEntropyLoss
 from evaluate import load
 import datetime
+import wandb
 
 import torch
 
@@ -18,6 +18,7 @@ class BasicLM(L.LightningModule):
     def __init__(
         self,
         args,
+        tokenizer,
         generation_config=None,
         save_hyperparameters: bool = True,
     ) -> None:
@@ -25,18 +26,23 @@ class BasicLM(L.LightningModule):
         if save_hyperparameters:
             self.save_hyperparameters(ignore=["save_hyperparameters"])
         self.args = args
-        # For generation we should set the padding side to left so we need a new tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path or args.hf_model_name, use_fast=True, padding_side='left')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = tokenizer
         self.generation_config = generation_config
 
         config = AutoConfig.from_pretrained(args.hf_model_name, return_dict=True)
-        config.attn_implementation="flash_attention_2"
+        config.attn_implementation = "flash_attention_2"
         self.model = AutoModelForCausalLM.from_pretrained(args.hf_model_name, config=config)
-        self.loss = CrossEntropyLoss(ignore_index=-100, reduction='none')
+        self.model.generation_config.pad_token_id = tokenizer.pad_token_id
+        self.loss = CrossEntropyLoss(ignore_index=-100, reduction="none")
 
-        self.acc_metric = load("accuracy", experiment_id=str(datetime.datetime.now()).replace(":", "_").replace(" ", "_").replace(".", "_"))
-        self.squad_metric = load("squad", experiment_id=str(datetime.datetime.now()).replace(":", "_").replace(" ", "_").replace(".", "_"))
+        self.acc_metric = load(
+            "accuracy", experiment_id=str(datetime.datetime.now()).replace(":", "_").replace(" ", "_").replace(".", "_")
+        )
+        self.squad_metric = load(
+            "squad", experiment_id=str(datetime.datetime.now()).replace(":", "_").replace(" ", "_").replace(".", "_")
+        )
+
+        self.sample_table = wandb.Table(columns=["timestep", "prompt", "pred", "label", "em", "f1"])
 
         # if self.freeze > 0:
         #     logger.info(f"Freezing {self.freeze} layers of the model")
@@ -48,7 +54,7 @@ class BasicLM(L.LightningModule):
         #         for param in layer.parameters():
         #             param.requires_grad = True
 
-    def forward(self, input_ids, attention_masks, labels, sample_count):
+    def forward(self, input_ids, attention_masks, labels):
         input_check = torch.where(labels == -100, -100, labels)
         assert torch.all(labels == input_check), f"input_ids and labels do not match: {input_ids} != {input_check}"
         return self.model(
@@ -58,7 +64,7 @@ class BasicLM(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        output = self(**batch)
+        output = self(input_ids=batch["input_ids"], attention_masks=batch["attention_masks"], labels=batch["labels"])
         custom_loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
         self.log_dict(
             {
@@ -76,15 +82,21 @@ class BasicLM(L.LightningModule):
         return output.loss
 
     def validation_step(self, batch, batch_idx):
-        output = self(**batch)
+        output = self(input_ids=batch["input_ids"], attention_masks=batch["attention_masks"], labels=batch["labels"])
         loss = self.calculate_loss(output.logits, batch["labels"], batch["sample_count"])
         predictions = torch.argmax(output.logits[:, :-1, :].contiguous(), axis=-1).view(-1)
         labels = batch["labels"][:, 1:].contiguous().view(-1)
         mask = labels.ne(-100)
         accuracy = self.acc_metric.compute(predictions=predictions[mask], references=labels[mask])["accuracy"]
-        # Does not work complety as of now. Fix generation_input_ids
+        # Does not work complety as of now. Fix weird cuda error
         # if self.args.generate_in_validation:
-        #     self.generate(batch)
+        #     self.generate(
+        #         input_ids=batch["generation_input_ids"],
+        #         attention_masks=batch["generation_attention_masks"],
+        #         labels=batch["generation_labels"],
+        #         sample_count=batch["sample_count"],
+        #         batch_idx=batch_idx,
+        #     )
         self.log_dict(
             {
                 "val/loss": output.loss,
@@ -115,25 +127,25 @@ class BasicLM(L.LightningModule):
             "mean": total_mean_loss,
         }
 
-    def generate(self, batch):
+    def generate(self, input_ids, attention_masks, labels, sample_count, batch_idx):
         """
-            Generate while training to log EM and F1 scores.
+        Generate while training to log EM and F1 scores.
         """
-        #TODO: We need the right input ids, left padded, without labales probably have to create them also in the batch
+        # TODO: We need the right input ids, left padded, without labales probably have to create them also in the batch
         predictions = self.model.generate(
-            input_ids=batch["generation_input_ids"],
-            attention_mask=batch["attention_masks"],
-            max_new_tokens=1, #labels.shape[1] - generation_input_ids.shape[1],
+            input_ids=input_ids,
+            attention_mask=attention_masks,
+            max_new_tokens=labels.shape[1],
             **self.generation_config,
         )
-        # Decode labels and predictions only where labels not -100
-        predictions = torch.where(batch["labels"] == -100, self.tokenizer.pad_token_id, predictions)
-        labels = torch.where(batch["labels"] == -100, self.tokenizer.pad_token_id, batch["labels"])
+        # TODO: Is this correct? We need to remove the input ids from the predictions
+        predictions = predictions[:, input_ids.shape[-1] :]
+        # Decode labels and predictions
         pred_text = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
         label_text = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
         # Get it into the squad format
-        squad_label = [{'id': str(i), 'answers': {'text': [text], 'answer_start': [0]}} for i, text in enumerate(label_text)]
-        squad_pred = [{'id': str(i), 'prediction_text': text} for i, text in enumerate(pred_text)]
+        squad_label = [{"id": str(i), "answers": {"text": [text], "answer_start": [0]}} for i, text in enumerate(label_text)]
+        squad_pred = [{"id": str(i), "prediction_text": text} for i, text in enumerate(pred_text)]
         metrics = self.squad_metric.compute(predictions=squad_pred, references=squad_label)
         self.log_dict(
             {
@@ -143,9 +155,24 @@ class BasicLM(L.LightningModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=batch["input_ids"].shape[0],
+            batch_size=input_ids.shape[0],
         )
 
+        if batch_idx == 0:
+            prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+            for i in range(sample_count[0]):
+                individual_metrics = self.squad_metric.compute(predictions=[squad_pred[i]], references=[squad_label[i]])
+                self.sample_table.add_data(
+                    self.global_step,
+                    prompts[i],
+                    pred_text[i],
+                    label_text[i],
+                    individual_metrics["exact_match"],
+                    individual_metrics["f1"],
+                )
+
+    # def on_train_end(self):
+    #     wandb.log({"sample_table": self.sample_table})
 
     def configure_optimizers(self):
         if self.global_rank == 0:
