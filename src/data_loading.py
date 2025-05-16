@@ -334,27 +334,31 @@ class PromptLoader:
         dataset_list = []
         for dataset_ids, templates in tqdm(datasets_iterator, desc="Iterating over datasets"):
             dataset_id, subset = dataset_ids
+            # For debug purposes we only want to load a few datasets
             if dataset_id in BAD_TASKS or (dataset_id, subset) not in self.debug_tasks:
+                continue
+            if split == "train" and dataset_id in T0_HELDOUT_TASKS:
+                continue
+            elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
                 continue
             dataset_path = (
                 os.path.join(self.tokenized_data_path, dataset_id, subset)
                 if subset
                 else os.path.join(self.tokenized_data_path, dataset_id)
             )
-            if split == "train" and dataset_id in T0_HELDOUT_TASKS:
-                continue
-            elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
-                continue
+            # We first try to load the dataset from disk if we have tokenized it before
             try:
                 logger.info(f"Processing {dataset_id}...")
                 dataset = Dataset.load_from_disk(dataset_path)
                 logger.info(f"Loaded {dataset_id} dataset from disk.")
                 dataset_list.append(dataset)
             except OSError as e:
+                # If this fails we try to load the dataset from the hub
                 try:
                     dataset = load_dataset(dataset_id, subset, split=split, trust_remote_code=True)
                 except (ValueError, TypeError) as e:
                     dataset = load_dataset(dataset_id, subset, split=split)
+                # For each sample in the dataset we apply the templates
                 for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
                     inputs, labels = [], []
                     for template_id, template in templates.templates.items():
@@ -362,12 +366,16 @@ class PromptLoader:
                         inputs.append(input_prompt)
                         labels.append(label)
 
+                    # We tokenize all examples of a sample in one list and add them to the sample list
+                    # Note for the labels we do not want to add a BOS token
                     sample_inputs.append(self.tokenizer(inputs, padding=False)["input_ids"])
                     sample_labels.append(self.tokenizer(labels, padding=False, add_special_tokens=False)["input_ids"])
+                # We save the individual dataset to disk and add it to the dataset list
                 dataset = Dataset.from_dict({"input_ids": sample_inputs, "labels": sample_labels})
                 dataset.save_to_disk(dataset_path)
                 dataset_list.append(dataset)
 
+        # We merge all datasets, shuffle them and save them to disk
         full_dataset = datasets.concatenate_datasets(dataset_list)
         full_dataset = full_dataset.shuffle(seed=self.seed)
         full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))
