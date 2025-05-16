@@ -1,5 +1,3 @@
-from typing import Literal
-
 import lightning as L
 from print_on_steroids import logger
 from torch.optim import AdamW
@@ -28,11 +26,11 @@ class BasicLM(L.LightningModule):
         self.args = args
         self.tokenizer = tokenizer
         self.generation_config = generation_config
+        self.generation_config["pad_token_id"] = tokenizer.eos_token_id
 
         config = AutoConfig.from_pretrained(args.hf_model_name, return_dict=True)
         config.attn_implementation = "flash_attention_2"
         self.model = AutoModelForCausalLM.from_pretrained(args.hf_model_name, config=config)
-        self.model.generation_config.pad_token_id = tokenizer.pad_token_id
         self.loss = CrossEntropyLoss(ignore_index=-100, reduction="none")
 
         self.acc_metric = load(
@@ -88,15 +86,14 @@ class BasicLM(L.LightningModule):
         labels = batch["labels"][:, 1:].contiguous().view(-1)
         mask = labels.ne(-100)
         accuracy = self.acc_metric.compute(predictions=predictions[mask], references=labels[mask])["accuracy"]
-        # Does not work complety as of now. Fix weird cuda error
-        # if self.args.generate_in_validation:
-        #     self.generate(
-        #         input_ids=batch["generation_input_ids"],
-        #         attention_masks=batch["generation_attention_masks"],
-        #         labels=batch["generation_labels"],
-        #         sample_count=batch["sample_count"],
-        #         batch_idx=batch_idx,
-        #     )
+        if self.args.generate_in_validation:
+            self.generate(
+                input_ids=batch["generation_input_ids"],
+                attention_masks=batch["generation_attention_masks"],
+                labels=batch["generation_labels"],
+                sample_count=batch["sample_count"],
+                batch_idx=batch_idx,
+            )
         self.log_dict(
             {
                 "val/loss": output.loss,
@@ -131,7 +128,6 @@ class BasicLM(L.LightningModule):
         """
         Generate while training to log EM and F1 scores.
         """
-        # TODO: We need the right input ids, left padded, without labales probably have to create them also in the batch
         predictions = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_masks,
@@ -171,8 +167,8 @@ class BasicLM(L.LightningModule):
                     individual_metrics["f1"],
                 )
 
-    # def on_train_end(self):
-    #     wandb.log({"sample_table": self.sample_table})
+    def on_train_end(self):
+        wandb.log({"sample_table": self.sample_table})
 
     def configure_optimizers(self):
         if self.global_rank == 0:
