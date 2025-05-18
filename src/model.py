@@ -53,7 +53,7 @@ class BasicLM(L.LightningModule):
         #             param.requires_grad = True
 
     def forward(self, input_ids, attention_masks, labels):
-        input_check = torch.where(labels == -100, -100, labels)
+        input_check = torch.where(labels == -100, -100, input_ids)
         assert torch.all(labels == input_check), f"input_ids and labels do not match: {input_ids} != {input_check}"
         return self.model(
             input_ids=input_ids,
@@ -168,7 +168,7 @@ class BasicLM(L.LightningModule):
                 )
 
     def on_train_end(self):
-        wandb.log({"sample_table": self.sample_table})
+        self.log({"sample_table", self.sample_table})
 
     def configure_optimizers(self):
         if self.global_rank == 0:

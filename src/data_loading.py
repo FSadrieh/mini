@@ -270,6 +270,7 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
                 mask = torch.arange(training_max_len).unsqueeze(0) >= torch.tensor(batch_lengths).unsqueeze(1)
                 training_labels = torch.where(mask, training_labels, torch.full_like(training_labels, -100))
                 training_labels[training_labels == tokenizer.pad_token_id] = -100
+                attention_masks = (training_input_ids != tokenizer.pad_token_id).long()
                 # Replace the -1 with the eos_token_id
                 training_input_ids[training_input_ids == -1] = tokenizer.eos_token_id
                 training_labels[training_labels == -1] = tokenizer.eos_token_id
@@ -277,7 +278,7 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
                     {
                         "input_ids": training_input_ids.long(),
                         "labels": training_labels.long(),
-                        "attention_masks": (training_input_ids != tokenizer.pad_token_id).long(),
+                        "attention_masks": attention_masks,
                         "sample_count": batch_counter,
                         "generation_input_ids": generation_input_ids.long(),
                         "generation_labels": generation_labels.long(),
