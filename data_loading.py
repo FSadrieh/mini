@@ -6,7 +6,7 @@ from typing import Iterator, Tuple
 import torch
 
 from datasets import load_dataset, Dataset, load_from_disk
-# from promptsource.templates import TemplateCollection
+from promptsource.templates import TemplateCollection
 
 import datasets
 from print_on_steroids import logger
@@ -82,7 +82,7 @@ class CustomDataLoader():
 
         self.tokenizer = tokenizer
         self.tokenizer_path = tokenizer_name
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_id = self.tokenizer.eos_id
 
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size
@@ -114,11 +114,11 @@ class CustomDataLoader():
 
     def preprocess_data(self, split: str) -> Dataset:
         if not os.path.isdir(self.processed_data_path(split)):
-            os.makedirs(self.processed_data_path(split))
+            os.makedirs(self.processed_data_path(split), exist_ok=True)
 
         try:
             dataset = Dataset.load_from_disk(self.tokenized_data_path + f"/{split}/")
-        except OSError as e:
+        except OSError:
             logger.info(f"Creating tokenized dataset for {split}...")
             dataset = self.loader.iterate_prompts(split=split)
 
@@ -139,16 +139,9 @@ class CustomDataLoader():
         return dataset
 
     def get_collator(self):
-        def collate(self, examples):
-            return {
-                "input_ids": examples[0]["batches"]["input_ids"],
-                "labels": examples[0]["batches"]["labels"],
-                "attention_masks": examples[0]["batches"]["attention_masks"],
-                "sample_count": examples[0]["batches"]["sample_count"].tolist(),
-                "generation_input_ids": examples[0]["batches"]["generation_input_ids"],
-                "generation_labels": examples[0]["batches"]["generation_labels"],
-                "generation_attention_masks": examples[0]["batches"]["generation_attention_masks"],
-            }
+        def collate(examples):
+            return {k: torch.tensor(v) for k, v in examples[0]["batches"].items()}
+
         return collate
 
 
@@ -184,9 +177,9 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
     def padding_helper(to_pad: list[torch.tensor], pad_right=True) -> Tuple[torch.tensor, int]:
         max_len = max(len(t) for t in to_pad)
         if pad_right:
-            padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=tokenizer.pad_token_id) for t in to_pad]
+            padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=tokenizer.pad_id) for t in to_pad]
         else:
-            padded = [torch.nn.functional.pad(t, (max_len - t.shape[0], 0), value=tokenizer.pad_token_id) for t in to_pad]
+            padded = [torch.nn.functional.pad(t, (max_len - t.shape[0], 0), value=tokenizer.pad_id) for t in to_pad]
         return torch.stack(padded), max_len
 
     def preprocess_function(examples):
@@ -219,20 +212,24 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
                 training_labels = training_input_ids.clone()
                 mask = torch.arange(training_max_len).unsqueeze(0) >= torch.tensor(batch_lengths).unsqueeze(1)
                 training_labels = torch.where(mask, training_labels, torch.full_like(training_labels, -100))
-                training_labels[training_labels == tokenizer.pad_token_id] = -100
-                attention_masks = (training_input_ids != tokenizer.pad_token_id).long()
-                # Replace the -1 with the eos_token_id
-                training_input_ids[training_input_ids == -1] = tokenizer.eos_token_id
-                training_labels[training_labels == -1] = tokenizer.eos_token_id
+                training_labels[training_labels == tokenizer.pad_id] = -100
+                attention_masks = (training_input_ids != tokenizer.pad_id).long()
+                # Make the attention mask 3D
+                causal_attention_mask = torch.tril(torch.ones((training_max_len, training_max_len), device=attention_masks.device)).unsqueeze(0)
+                attention_mask = attention_masks.unsqueeze(1) * causal_attention_mask
+
+                # Replace the -1 with the eos_id
+                training_input_ids[training_input_ids == -1] = tokenizer.eos_id
+                training_labels[training_labels == -1] = tokenizer.eos_id
                 batches.append(
                     {
                         "input_ids": training_input_ids.long(),
                         "labels": training_labels.long(),
-                        "attention_masks": attention_masks,
+                        "attention_masks": attention_mask.long(),
                         "sample_count": batch_counter,
                         "generation_input_ids": generation_input_ids.long(),
                         "generation_labels": generation_labels.long(),
-                        "generation_attention_masks": (generation_input_ids != tokenizer.pad_token_id).long(),
+                        "generation_attention_masks": (generation_input_ids != tokenizer.pad_id).long(),
                     }
                 )
                 # Reset everything for the next batch
@@ -314,13 +311,14 @@ class PromptLoader:
                     inputs, labels = [], []
                     for template_id, template in templates.templates.items():
                         input_prompt, label = template.apply(sample)
-                        inputs.append(input_prompt)
-                        labels.append(label)
+                        inputs.append(self.tokenizer.encode(input_prompt, add_bos=True, add_eos=False))
+                        labels.append(self.tokenizer.encode(label, add_bos=False, add_eos=False))
 
                     # We tokenize all examples of a sample in one list and add them to the sample list
                     # Note for the labels we do not want to add a BOS token
-                    sample_inputs.append(self.tokenizer(inputs, padding=False)["input_ids"])
-                    sample_labels.append(self.tokenizer(labels, padding=False, add_special_tokens=False)["input_ids"])
+                    # TODO: Need to https://docs.pytorch.org/torchtune/0.2/generated/torchtune.models.llama3.Llama3Tokenizer.html different tokenizer
+                    sample_inputs.append(inputs)
+                    sample_labels.append(labels)
                 # We save the individual dataset to disk and add it to the dataset list
                 dataset = Dataset.from_dict({"input_ids": sample_inputs, "labels": sample_labels})
                 dataset.save_to_disk(dataset_path)
