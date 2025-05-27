@@ -127,7 +127,7 @@ class CustomDataLoader():
         dataset = dataset.map(
             make_preprocess_function(batch_size, self.tokenizer),
             batched=True,
-            batch_size=16_000,
+            batch_size=1_000,
             remove_columns=dataset.column_names,
             num_proc=self.preprocessing_workers,
             desc="Preprocessing dataset",
@@ -174,12 +174,12 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
     For generation we need left padded input_ids, the raw labels and the attention mask.
     """
 
-    def padding_helper(to_pad: list[torch.tensor], pad_right=True) -> Tuple[torch.tensor, int]:
+    def padding_helper(to_pad: list[torch.tensor], pad_right=True, pad_id: int = tokenizer.pad_id) -> Tuple[torch.tensor, int]:
         max_len = max(len(t) for t in to_pad)
         if pad_right:
-            padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=tokenizer.pad_id) for t in to_pad]
+            padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in to_pad]
         else:
-            padded = [torch.nn.functional.pad(t, (max_len - t.shape[0], 0), value=tokenizer.pad_id) for t in to_pad]
+            padded = [torch.nn.functional.pad(t, (max_len - t.shape[0], 0), value=pad_id) for t in to_pad]
         return torch.stack(padded), max_len
 
     def preprocess_function(examples):
@@ -205,7 +205,7 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
             if len(batch_training_input_ids) + len(input_examples) > batch_size:
                 # We find the maximum length in the batch and pad the input
                 training_input_ids, training_max_len = padding_helper(batch_training_input_ids, pad_right=True)
-                generation_input_ids, __ = padding_helper(batch_generation_input_ids, pad_right=False)
+                generation_input_ids, __ = padding_helper(batch_generation_input_ids, pad_right=False, pad_id=0)
                 generation_labels, __ = padding_helper(batch_generation_labels, pad_right=True)
 
                 # The labels are -100 for the input ids and the padding tokens. Only the original labels are kept

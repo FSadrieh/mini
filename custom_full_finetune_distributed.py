@@ -22,6 +22,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from torchtune.generation import generate
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, modules, training, utils
@@ -53,7 +54,6 @@ from evaluate import load
 import datetime
 
 from data_loading import CustomDataLoader
-from custom_loss import CustomLoss
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -751,28 +751,41 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 outputs = outputs.full_tensor()
 
         # Compute loss
-        loss = self._loss_fn(outputs, labels)
+        # Shift labels 
+        shifted_labels = torch.cat(
+            [
+                labels[:, 1:],
+                torch.full(
+                    (labels.size(0), 1),
+                    fill_value=self._loss_fn.ignore_index,
+                    dtype=labels.dtype,
+                    device=labels.device,
+                ),
+            ],
+            dim=-1,
+        )
+        loss = self._loss_fn(outputs, shifted_labels)
 
         # Compute accuracy
         logits = self._model.output(outputs)
-        custom_losses = self.calculate_loss(logits, labels, batch["sample_count"])
+        custom_losses = self.calculate_loss(logits, labels, batch["sample_count"].tolist())
         predictions = torch.argmax(logits[:, :-1, :].contiguous(), axis=-1).view(-1)
         labels = labels[:, 1:].contiguous().view(-1)
         mask = labels.ne(-100)
         accuracy = self.acc_metric.compute(predictions=predictions[mask], references=labels[mask])["accuracy"]
 
-
-        self._metric_logger.log_dict(
-            {
-                f"{mode}/accuracy": accuracy,
-                f"{mode}/loss": loss.item(),
-                f"{mode}/mean_loss": custom_losses["mean"],
-                f"{mode}/sum_loss": custom_losses["sum"],
-                f"{mode}/distance_loss": custom_losses["distance"],
-                f"{mode}/var_loss": custom_losses["variance"],
-            },
-            step=self.global_step,
-        )
+        if self._is_rank_zero:
+            self._metric_logger.log_dict(
+                {
+                    f"{mode}/accuracy": accuracy,
+                    f"{mode}/loss": loss.item(),
+                    f"{mode}/mean_loss": custom_losses["mean"],
+                    f"{mode}/sum_loss": custom_losses["sum"],
+                    f"{mode}/distance_loss": custom_losses["distance"],
+                    f"{mode}/var_loss": custom_losses["variance"],
+                },
+                step=self.global_step,
+            )
 
         # free logits otherwise it peaks backward memory
         del outputs
@@ -990,8 +1003,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._profiler.stop()
 
     def cleanup(self) -> None:
-        self._metric_logger.log({"sample_table", self.sample_table})
         if self._is_rank_zero:
+            self._metric_logger.log({"sample_table", self.sample_table})
             self._metric_logger.close()
         destroy_process_group()
 
@@ -1016,31 +1029,31 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         """
         Generate while training to log EM and F1 scores.
         """
-        predictions = self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_masks,
-            max_new_tokens=labels.shape[1],
-            **self.generation_config,
-        )
+        predictions = generate(
+            prompt=input_ids,
+            model=self._model,
+            max_generated_tokens=labels.shape[1],
+        )[0]
         # TODO: Is this correct? We need to remove the input ids from the predictions
         predictions = predictions[:, input_ids.shape[-1] :]
         # Decode labels and predictions
-        pred_text = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        label_text = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        pred_text = [self._tokenizer.decode(prediction, truncate_at_eos=True) for prediction in predictions.tolist()]
+        label_text = [self._tokenizer.decode(label, truncate_at_eos=True) for label in labels.tolist()]
         # Get it into the squad format
         squad_label = [{"id": str(i), "answers": {"text": [text], "answer_start": [0]}} for i, text in enumerate(label_text)]
         squad_pred = [{"id": str(i), "prediction_text": text} for i, text in enumerate(pred_text)]
         metrics = self.squad_metric.compute(predictions=squad_pred, references=squad_label)
-        self._metric_logger.log_dict(
-            {
-                "val/em": metrics["exact_match"],
-                "val/f1": metrics["f1"],
-            },
-            step=self.global_step,
-        )
+        if self._is_rank_zero:
+            self._metric_logger.log_dict(
+                {
+                    "val/em": metrics["exact_match"],
+                    "val/f1": metrics["f1"],
+                },
+                step=self.global_step,
+            )
 
         if batch_idx == 0:
-            prompts = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+            prompts = [self._tokenizer.decode(input_id, truncate_at_eos=True) for input_id in input_ids.tolist()]
             for i in range(sample_count[0]):
                 individual_metrics = self.squad_metric.compute(predictions=[squad_pred[i]], references=[squad_label[i]])
                 self.sample_table.add_data(
@@ -1086,10 +1099,10 @@ def recipe_main(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     current_process_rank = get_rank()
     port = 5678
-    if current_process_rank == 0:
-        debugpy.listen(("0.0.0.0", port))
-        print(
-            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-        )
-        debugpy.wait_for_client()
+    # if current_process_rank == 0:
+    #     debugpy.listen(("0.0.0.0", port))
+    #     print(
+    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+    #     )
+    #     debugpy.wait_for_client()
     sys.exit(recipe_main())
