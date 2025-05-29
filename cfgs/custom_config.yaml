@@ -29,17 +29,17 @@ tokenizer:
 # Dataset and Sampler
 dataset:
   firstn_datasets: 0
-  data_location: /data/shared/ld/mini
+  data_location: data
   preprocessing_workers: 1
 seed: null
-batch_size: 8
+batch_size: 32
 
 # Validation
-run_val_every_n_steps: null  # Change to an integer to enable validation every N steps
+run_val_every_n_steps: 32  # Change to an integer to enable validation every N steps
 dataset_val:
   _component_: torchtune.datasets.alpaca_cleaned_dataset
   split: train[95%:]
-batch_size_val: 64
+batch_size_val: 256
 
 # Model Arguments
 model:
@@ -64,9 +64,9 @@ loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 
 # Training
-epochs: 1
+epochs: 3
 max_steps_per_epoch: null
-gradient_accumulation_steps: 8  # Use to increase effective batch size
+gradient_accumulation_steps: 2  # Use to increase effective batch size
 
 # Environment
 device: cuda
@@ -81,13 +81,13 @@ optimizer_in_bwd: False  # True saves memory. Requires gradient_accumulation_ste
 
 
 # Logging
-metric_logger: #TODO: Enable Disk logging
-  _component_: torchtune.training.metric_logging.DiskLogger
-  log_dir: ${output_dir}/logs
-# metric_logger: #TODO: Enable WandB logging
-#   _component_: torchtune.training.metric_logging.WandBLogger
-#   project: mini
-#   entity: transformersclub
+# metric_logger: #TODO: Enable Disk logging
+#   _component_: torchtune.training.metric_logging.DiskLogger
+#   log_dir: ${output_dir}/logs
+metric_logger: #TODO: Enable WandB logging
+  _component_: torchtune.training.metric_logging.WandBLogger
+  project: mini
+  entity: transformersclub
 log_every_n_steps: 1
 log_peak_memory_stats: True
 log_level: INFO  # DEBUG, WARN, etc.
