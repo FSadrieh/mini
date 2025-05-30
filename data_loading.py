@@ -321,7 +321,6 @@ class PromptLoader:
                 "blbooksgenre",
                 "hellaswag",
                 "newspop",
-                "samsum",
                 "winogrande",
                 "wiqa",
             ]:

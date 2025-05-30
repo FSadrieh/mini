@@ -15,6 +15,7 @@ from warnings import warn
 
 import torch
 from omegaconf import DictConfig, ListConfig
+from statistics import fmean
 
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
@@ -52,6 +53,7 @@ from tqdm import tqdm
 import wandb
 from evaluate import load
 import datetime
+from torchmetrics.text import Perplexity
 
 from data_loading import CustomDataLoader
 
@@ -210,10 +212,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._fp8_recipe_name = cfg.get("fp8_recipe_name", None)
 
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
-        if self._run_val_every_n_steps is not None:
-            assert (
-                cfg.get("dataset_val") is not None
-            ), "run_val_every_n_steps is set but dataset_val is not configured"
+        self._eval_batches = cfg.get("eval_batches", 0)
 
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
@@ -278,20 +277,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.sample_table = wandb.Table(
             columns=["timestep", "prompt", "pred", "label", "em", "f1"]
         )
-        self.acc_metric = load(
-            "accuracy",
-            experiment_id=str(datetime.datetime.now())
-            .replace(":", "_")
-            .replace(" ", "_")
-            .replace(".", "_"),
-        )
-        self.squad_metric = load(
-            "squad",
-            experiment_id=str(datetime.datetime.now())
-            .replace(":", "_")
-            .replace(" ", "_")
-            .replace(".", "_"),
-        )
+        self.acc_metric = load("accuracy")
+        self.squad_metric = load("squad")
+        self.bertscore = load("bertscore")
+        self.bleu = load("bleu")
+        self.rouge = load("rouge")
+        self.ppl = Perplexity(ignore_index=-100)
+
         self.custom_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
 
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
@@ -458,16 +450,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "preprocessing_workers": cfg.dataset.get("preprocessing_workers", 1),
         }
 
-        if cfg.get("dataset_val") is not None:
-            data_config["val_batch_size"] = cfg.get("batch_size_val", cfg.batch_size)
+        data_config["val_batch_size"] = cfg.get("batch_size_val", cfg.batch_size)
 
         data_loader = CustomDataLoader(**data_config)
         self._dataloader = self._setup_data(data_loader, "train")
 
         # Setup validation dataloader if validation dataset is provided
-        self._val_dataloader = None
-        if cfg.get("dataset_val") is not None:
-            self._val_dataloader = self._setup_data(data_loader, "validation")
+        self._val_dataloader = self._setup_data(data_loader, "validation")
 
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
@@ -847,22 +836,29 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             logits, labels, batch["sample_count"].tolist()
         )
         predictions = torch.argmax(logits[:, :-1, :].contiguous(), axis=-1).view(-1)
-        labels = labels[:, 1:].contiguous().view(-1)
-        mask = labels.ne(-100)
+        labels = labels[:, 1:].contiguous()
+        mask = labels.view(-1).ne(-100)
         accuracy = self.acc_metric.compute(
-            predictions=predictions[mask], references=labels[mask]
+            predictions=predictions[mask], references=labels.view(-1)[mask]
         )["accuracy"]
 
         if self._is_rank_zero:
+            log_dict = {
+                f"{mode}/accuracy": accuracy,
+                f"{mode}/loss": loss.item(),
+                f"{mode}/mean_loss": custom_losses["mean"],
+                f"{mode}/sum_loss": custom_losses["sum"],
+                f"{mode}/distance_loss": custom_losses["distance"],
+                f"{mode}/var_loss": custom_losses["variance"],
+            }
+            if mode == "val":
+                log_dict[f"{mode}/ppl"] = self.ppl.compute(
+                        logits=logits[:, :-1, :].contiguous(),
+                        labels=labels,
+                    )["perplexity"]
+
             self._metric_logger.log_dict(
-                {
-                    f"{mode}/accuracy": accuracy,
-                    f"{mode}/loss": loss.item(),
-                    f"{mode}/mean_loss": custom_losses["mean"],
-                    f"{mode}/sum_loss": custom_losses["sum"],
-                    f"{mode}/distance_loss": custom_losses["distance"],
-                    f"{mode}/var_loss": custom_losses["variance"],
-                },
+                log_dict,
                 step=self.global_step,
             )
 
@@ -881,6 +877,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self._val_dataloader):
+                if batch_idx >= self._eval_batches:
+                    continue
                 utils.batch_to_device(batch, self._device)
 
                 # Count tokens excluding padding
@@ -1122,7 +1120,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
-            self._metric_logger.log({"sample_table", self.sample_table})
+            self._metric_logger.log({"sample_table": self.sample_table})
             self._logger.info("Training completed. Logged sample table...")
             self._metric_logger.close()
         destroy_process_group()
@@ -1211,11 +1209,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         metrics = self.squad_metric.compute(
             predictions=squad_pred, references=squad_label
         )
+        bleu_score = self.bleu.compute(predictions=pred_text, references=label_text)["bleu"]
+        rouge_score = self.rouge.compute(predictions=pred_text, references=label_text)["rougeL"]
+        bert_score = self.bertscore.compute(predictions=pred_text, references=label_text, lang="en") #TODO: Seems to be very slow look how slow each of the metris are
+
         if self._is_rank_zero:
+            # TODO: Log rouge etc.
             self._metric_logger.log_dict(
                 {
                     "val/em": metrics["exact_match"],
                     "val/f1": metrics["f1"],
+                    "val/bleu": bleu_score,
+                    "val/rouge": rouge_score,
+                    "val/bert_score": fmean(bert_score["f1"]),
                 },
                 step=self.global_step,
             )
@@ -1272,10 +1278,10 @@ def recipe_main(cfg: DictConfig) -> None:
 if __name__ == "__main__":
     current_process_rank = get_rank()
     port = 5678
-    # if current_process_rank == 0:
-    #     debugpy.listen(("0.0.0.0", port))
-    #     print(
-    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-    #     )
-    #     debugpy.wait_for_client()
+    if current_process_rank == 0:
+        debugpy.listen(("0.0.0.0", port))
+        print(
+            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+        )
+        debugpy.wait_for_client()
     sys.exit(recipe_main())
