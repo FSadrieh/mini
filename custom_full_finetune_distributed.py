@@ -439,24 +439,51 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
 
-        tokenizer_name = cfg.tokenizer._component_.split(".")[-1]
-        data_config = {
-            "tokenizer": self._tokenizer,
-            "tokenizer_name": tokenizer_name,
-            "batch_size": cfg.batch_size,
-            "firstn_datasets": cfg.dataset.get("firstn_datasets", None),
-            "seed": cfg.get("seed", self.seed),
-            "data_location": cfg.dataset.get("data_location", "data"),
-            "preprocessing_workers": cfg.dataset.get("preprocessing_workers", 1),
-        }
 
-        data_config["val_batch_size"] = cfg.get("batch_size_val", cfg.batch_size)
-
-        data_loader = CustomDataLoader(**data_config)
-        self._dataloader = self._setup_data(data_loader, "train")
+        collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
+        self._dataloader = self._setup_data(
+            cfg_dataset=cfg.dataset,
+            shuffle=cfg.shuffle,
+            batch_size=cfg.batch_size,
+            collate_fn=collate_name,
+        )
 
         # Setup validation dataloader if validation dataset is provided
-        self._val_dataloader = self._setup_data(data_loader, "validation")
+        self._val_dataloader = None
+        if cfg.get("dataset_val") is not None:
+            batch_size_val = cfg.get("batch_size_val", cfg.batch_size)
+            self._val_dataloader = self._setup_data(
+                cfg_dataset=cfg.dataset_val,
+                batch_size=batch_size_val,
+                collate_fn=collate_name,
+                shuffle=False,
+            )
+
+
+        # TODO: New data loading
+        # tokenizer_name = cfg.tokenizer._component_.split(".")[-1]
+        # data_config = {
+        #     "tokenizer": self._tokenizer,
+        #     "tokenizer_name": tokenizer_name,
+        #     "batch_size": cfg.batch_size,
+        #     "firstn_datasets": cfg.dataset.get("firstn_datasets", None),
+        #     "seed": cfg.get("seed", self.seed),
+        #     "data_location": cfg.dataset.get("data_location", "data"),
+        #     "preprocessing_workers": cfg.dataset.get("preprocessing_workers", 1),
+        # }
+
+        # data_config["val_batch_size"] = cfg.get("batch_size_val", cfg.batch_size)
+
+        # data_loader = CustomDataLoader(**data_config)
+        # self._dataloader = self._setup_data(data_loader, "train")
+
+        # # Setup validation dataloader if validation dataset is provided
+        # self._val_dataloader = self._setup_data(data_loader, "validation")
+
+
+
+
+
 
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
@@ -775,8 +802,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def _setup_data(
         self,
-        data_loader: CustomDataLoader,
-        split: str,
+        cfg_dataset: DictConfig,
+        shuffle: bool,
+        batch_size: int,
+        collate_fn: str,
         dataloader_state_dict: Optional[dict[str, Any]] = None,
     ) -> StatefulDataLoader:
         """
@@ -784,28 +813,80 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         map-style datasets. If a state_dict is provided (meaning we are resuming a training run),
         it is loaded into the dataloader.
         """
-        dataset = data_loader.load_dataset(split=split)
-        collate = data_loader.get_collator()
+        if isinstance(cfg_dataset, ListConfig):
+            datasets = [
+                config.instantiate(single_cfg_dataset, self._tokenizer)
+                for single_cfg_dataset in cfg_dataset
+            ]
+            ds = ConcatDataset(datasets=datasets)
+            packed = getattr(ds, "packed", False)
+        else:
+            ds = config.instantiate(cfg_dataset, self._tokenizer)
+            packed = cfg_dataset.get("packed", False)
+
+        # Instantiate collate_fn
+        if "left_pad_sequence" in collate_fn:
+            raise RuntimeError("left_pad_sequence collator is only for inference.")
+        collate_fn = _get_component_from_path(collate_fn)
+
+        sampler = StatefulDistributedSampler(
+            ds, num_replicas=self.dp_degree, rank=self.dp_rank, shuffle=shuffle, seed=0
+        )
         dataloader = StatefulDataLoader(
-            dataset=dataset,
-            batch_size=1,
-            collate_fn=collate,
+            dataset=ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            collate_fn=(
+                partial(
+                    collate_fn,
+                    padding_idx=self._tokenizer.pad_id,
+                    ignore_idx=self._loss_fn.ignore_index,
+                    pad_to_multiple_of=self.tp_degree,
+                )
+                if not packed
+                else padded_collate_packed
+            ),
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
         )
 
         return dataloader
 
+
+    # def _setup_data(
+    #     self,
+    #     data_loader: CustomDataLoader,
+    #     split: str,
+    #     dataloader_state_dict: Optional[dict[str, Any]] = None,
+    # ) -> StatefulDataLoader:
+    #     """
+    #     All data related setup happens here. This recipe currently supports only
+    #     map-style datasets. If a state_dict is provided (meaning we are resuming a training run),
+    #     it is loaded into the dataloader.
+    #     """
+    #     dataset = data_loader.load_dataset(split=split)
+    #     collate = data_loader.get_collator()
+    #     dataloader = StatefulDataLoader(
+    #         dataset=dataset,
+    #         batch_size=1,
+    #         collate_fn=collate,
+    #         # dropping last avoids shape issues with compile + flex attention
+    #         drop_last=True,
+    #     )
+
+    #     return dataloader
+
     def _loss_step(self, batch: dict[str, torch.Tensor], mode="train") -> torch.Tensor:
         # Shape [b, s], needed for the loss not the model
-        labels = batch.pop("label")
+        labels = batch.pop("labels")
         model_dtype = next(self._model.parameters()).dtype
 
         with self.activations_handling_ctx:
-            outputs = self._model(
-                tokens=batch["tokens"],
-                mask=batch["mask"].to(dtype=model_dtype),
-            )
+            outputs = self._model(**batch)
+            # outputs = self._model(
+            #     tokens=batch["tokens"],
+            #     mask=batch["mask"].to(dtype=model_dtype),
+            # )
 
         # post process for third party loss functions
         if not isinstance(self._loss_fn, modules.loss.SFTLoss):
@@ -813,30 +894,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             outputs = outputs.reshape(-1, outputs.size(-1))
             if isinstance(outputs, DTensor):
                 outputs = outputs.full_tensor()
-
+        loss = self._loss_fn(outputs, labels)
         # Compute loss
-        # Shift labels
-        shifted_labels = torch.cat(
-            [
-                labels[:, 1:],
-                torch.full(
-                    (labels.size(0), 1),
-                    fill_value=self._loss_fn.ignore_index,
-                    dtype=labels.dtype,
-                    device=labels.device,
-                ),
-            ],
-            dim=-1,
-        )
-        loss = self._loss_fn(outputs, shifted_labels)
+        # loss = self._loss_fn(outputs, shifted_labels)
 
         # Compute accuracy
         logits = self._model.output(outputs)
-        custom_losses = self.calculate_loss(
-            logits, labels, batch["sample_count"].tolist()
-        )
+        # custom_losses = self.calculate_loss(
+        #     logits, labels, batch["sample_count"].tolist()
+        # )
         predictions = torch.argmax(logits[:, :-1, :].contiguous(), axis=-1).view(-1)
-        labels = labels[:, 1:].contiguous()
+        # labels = labels[:, 1:].contiguous()
         mask = labels.view(-1).ne(-100)
         accuracy = self.acc_metric.compute(
             predictions=predictions[mask], references=labels.view(-1)[mask]
@@ -846,10 +914,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             log_dict = {
                 f"{mode}/accuracy": accuracy,
                 f"{mode}/loss": loss.item(),
-                f"{mode}/mean_loss": custom_losses["mean"],
-                f"{mode}/sum_loss": custom_losses["sum"],
-                f"{mode}/distance_loss": custom_losses["distance"],
-                f"{mode}/var_loss": custom_losses["variance"],
+                # f"{mode}/mean_loss": custom_losses["mean"],
+                # f"{mode}/sum_loss": custom_losses["sum"],
+                # f"{mode}/distance_loss": custom_losses["distance"],
+                # f"{mode}/var_loss": custom_losses["variance"],
             }
             if mode == "val":
                 self.ppl.update(
@@ -884,17 +952,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Count tokens excluding padding
                 current_num_tokens = (
-                    batch["label"] != self._loss_fn.ignore_index
+                    batch["labels"] != self._loss_fn.ignore_index
                 ).sum()
 
                 # Compute loss
                 val_loss = self._loss_step(batch, mode="val") * current_num_tokens
-                self.generate(
-                    prompts=batch["prompt"],
-                    labels=batch["generation_label"],
-                    sample_count=batch["sample_count"].tolist(),
-                    batch_idx=batch_idx,
-                )
+                # self.generate(
+                #     prompts=batch["prompt"],
+                #     labels=batch["generation_label"],
+                #     sample_count=batch["sample_count"].tolist(),
+                #     batch_idx=batch_idx,
+                # )
 
                 total_val_loss += val_loss
                 total_val_tokens += current_num_tokens
@@ -967,7 +1035,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
                 current_num_tokens = (
-                    batch["label"] != self._loss_fn.ignore_index
+                    batch["labels"] != self._loss_fn.ignore_index
                 ).sum()
                 num_tokens += current_num_tokens
 
@@ -1280,11 +1348,11 @@ def recipe_main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     current_process_rank = get_rank()
-    # port = 5678
-    # if current_process_rank == 0:
-    #     debugpy.listen(("0.0.0.0", port))
-    #     print(
-    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-    #     )
-    #     debugpy.wait_for_client()
+    port = 56788
+    if current_process_rank == 0:
+        debugpy.listen(("0.0.0.0", port))
+        print(
+            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+        )
+        debugpy.wait_for_client()
     sys.exit(recipe_main())
