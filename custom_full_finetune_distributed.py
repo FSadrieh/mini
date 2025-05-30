@@ -282,7 +282,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.bertscore = load("bertscore")
         self.bleu = load("bleu")
         self.rouge = load("rouge")
-        self.ppl = Perplexity(ignore_index=-100)
+        self.ppl = Perplexity(ignore_index=-100, dist_sync_on_step=False, sync_on_compute=False).to(self._device)
 
         self.custom_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
 
@@ -852,10 +852,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 f"{mode}/var_loss": custom_losses["variance"],
             }
             if mode == "val":
-                log_dict[f"{mode}/ppl"] = self.ppl.compute(
-                        logits=logits[:, :-1, :].contiguous(),
-                        labels=labels,
-                    )["perplexity"]
+                self.ppl.update(
+                        logits[:, :-1, :].contiguous(),
+                        labels,
+                    )
+                log_dict[f"{mode}/ppl"] = self.ppl.compute().item()
 
             self._metric_logger.log_dict(
                 log_dict,
@@ -887,7 +888,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ).sum()
 
                 # Compute loss
-                val_loss = self._loss_step(batch) * current_num_tokens
+                val_loss = self._loss_step(batch, mode="val") * current_num_tokens
                 self.generate(
                     prompts=batch["prompt"],
                     labels=batch["generation_label"],
@@ -945,6 +946,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             and self.global_step % self._run_val_every_n_steps == 0
         ):
             self.validate()
+            self.ppl.reset()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
@@ -1092,6 +1094,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         pbar.refresh()
                         self.validate()
+                        self.ppl.reset()
 
                 if (
                     (idx + 1) // self._gradient_accumulation_steps
@@ -1277,11 +1280,11 @@ def recipe_main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     current_process_rank = get_rank()
-    port = 5678
-    if current_process_rank == 0:
-        debugpy.listen(("0.0.0.0", port))
-        print(
-            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-        )
-        debugpy.wait_for_client()
+    # port = 5678
+    # if current_process_rank == 0:
+    #     debugpy.listen(("0.0.0.0", port))
+    #     print(
+    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+    #     )
+    #     debugpy.wait_for_client()
     sys.exit(recipe_main())
