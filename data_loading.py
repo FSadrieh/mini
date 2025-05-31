@@ -83,7 +83,6 @@ class CustomDataLoader:
 
         self.tokenizer = tokenizer
         self.tokenizer_path = tokenizer_name
-        self.tokenizer.pad_id = self.tokenizer.eos_id
 
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size
@@ -176,13 +175,13 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
     We want to batch the model input guaranteeing that all examples from a sample are in the same batch.
     Therefore, we greedily fill the batch until all examples from the next sample would not fit.
     For training we need the input_ids containing the prompt, the label, the eos token and maybe right padding; the labels (same size as the input_ids), but containing a -100 everywhere except for the label part;
-    the attention mask 0 for padding; and the sample count (how many examples for each sample are in the batch).
+    the attention mask is 1 everywhere for padding; and the sample count (how many examples for each sample are in the batch).
     For generation we need left padded input_ids, the raw labels and the attention mask.
     """
 
     def padding_helper(
         to_pad: list[torch.tensor], pad_right=True, pad_id: int = tokenizer.pad_id
-    ) -> Tuple[torch.tensor, int]:
+    ) -> torch.tensor:
         max_len = max(len(t) for t in to_pad)
         if pad_right:
             padded = [
@@ -194,18 +193,16 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
                 torch.nn.functional.pad(t, (max_len - t.shape[0], 0), value=pad_id)
                 for t in to_pad
             ]
-        return torch.stack(padded), max_len
+        return torch.stack(padded)
 
     def preprocess_function(examples):
         batches = []
         batch_tokens = []
-        batch_training_label = []
-        batch_mask = []
         batch_generation_label = []
         batch_prompt = []
         batch_counter = []
-        for sample_tokens, sample_mask, sample_prompt in zip(
-            examples["tokens"], examples["mask"], examples["prompt"]
+        for sample_tokens, sample_prompt in zip(
+            examples["tokens"], examples["prompt"]
         ):
             # If we have more examples for a give input than micro batch size we can not leave them in one batch
             if len(sample_tokens) > batch_size:
@@ -216,29 +213,32 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
             # If the examples of the next sample would not fit in the batch we create a new batch
             if len(batch_tokens) + len(sample_tokens) > batch_size:
                 # We find the maximum length in the batch and pad the input
-                tokens, training_max_len = padding_helper(batch_tokens, pad_right=True)
-                training_label, _ = padding_helper(
-                    batch_training_label, pad_right=True, pad_id=-100
+                tokens = padding_helper(batch_tokens, pad_right=True, pad_id = tokenizer.special_tokens["<|finetune_right_pad_id|>"])
+                prompt = padding_helper(batch_prompt, pad_right=False)
+                generation_label = padding_helper(
+                    batch_generation_label, pad_right=True
                 )
-                masks, _ = padding_helper(batch_mask, pad_right=True, pad_id=0)
-                prompt, __ = padding_helper(batch_prompt, pad_right=False, pad_id=0)
-                generation_label, __ = padding_helper(
-                    batch_generation_label, pad_right=True, pad_id=-100
+                labels = torch.cat(
+                    [
+                        tokens[:, 1:],
+                        torch.full(
+                            (tokens.size(0), 1),
+                            fill_value=-100,
+                            dtype=tokens.dtype,
+                            device=tokens.device,
+                        ),
+                    ],
+                    dim=-1,
                 )
 
-                # Make the attention mask 3D
-                causal_attention_mask = torch.tril(
-                    torch.ones(
-                        (training_max_len, training_max_len), device=masks.device
-                    )
-                ).unsqueeze(0)
-                masks = masks.unsqueeze(1) * causal_attention_mask
+                labels[labels == tokenizer.special_tokens["<|finetune_right_pad_id|>"]] = -100
+                labels[labels == tokenizer.eos_id] = -100
+
 
                 batches.append(
                     {
                         "tokens": tokens.long(),
-                        "label": training_label.long(),
-                        "mask": masks.long(),
+                        "labels": labels.long(),
                         "sample_count": batch_counter,
                         "prompt": prompt.long(),
                         "generation_label": generation_label.long(),
@@ -246,27 +246,22 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
                 )
                 # Reset everything for the next batch
                 batch_tokens = []
-                batch_training_label = []
-                batch_mask = []
                 batch_prompt = []
                 batch_generation_label = []
                 batch_counter = []
 
-            for example_tokens, example_mask, example_prompt in zip(
-                sample_tokens, sample_mask, sample_prompt
+            for example_tokens, example_prompt in zip(
+                sample_tokens, sample_prompt
             ):
                 # We append each example to the batch
-                training_label = torch.tensor(example_tokens)
-                training_label[: len(example_prompt)] = (
-                    -100
-                )  # Set the label to -100 for the prompt part
                 generation_label = example_tokens[
                     len(example_prompt) :
                 ]  # The label for the generation is the original label
 
+                # We do not want the model to generate end_of_text
+                generation_label = generation_label[:-1]
+
                 batch_tokens.append(torch.tensor(example_tokens))
-                batch_training_label.append(training_label)
-                batch_mask.append(torch.tensor(example_mask))
                 batch_prompt.append(torch.tensor(example_prompt))
                 batch_generation_label.append(torch.tensor(generation_label))
 
@@ -298,6 +293,14 @@ class PromptLoader:
             ("onestop_english", None),
         ]
 
+        self.more_tasks = [
+                "blbooksgenre",
+                "hellaswag",
+                "newspop",
+                "winogrande",
+                "wiqa",
+            ]
+
     def iterate_prompts(self, split: str = "train") -> Iterator[Tuple[str, str]]:
         datasets_iterator = self.collection.datasets_templates.items()
         if self.firstn_datasets:
@@ -310,20 +313,13 @@ class PromptLoader:
 
         sample_prompt = []
         sample_tokens = []
-        sample_mask = []
         dataset_list = []
         for dataset_ids, templates in tqdm(
             datasets_iterator, desc="Iterating over datasets"
         ):
             dataset_id, subset = dataset_ids
             # For debug purposes we only want to load a few datasets
-            if dataset_id in BAD_TASKS or dataset_id not in [
-                "blbooksgenre",
-                "hellaswag",
-                "newspop",
-                "winogrande",
-                "wiqa",
-            ]:
+            if dataset_id in BAD_TASKS or dataset_id not in self.more_tasks:
                 continue
             if split == "train" and dataset_id in T0_HELDOUT_TASKS:
                 continue
@@ -350,7 +346,7 @@ class PromptLoader:
                     dataset = load_dataset(dataset_id, subset, split=split)
                 # For each sample in the dataset we apply the templates
                 for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
-                    example_tokens, example_mask, example_prompt = [], [], []
+                    example_tokens, example_prompt = [], []
                     for template_id, template in templates.templates.items():
                         tokens, label = template.apply(sample)
                         messages = [
@@ -363,20 +359,17 @@ class PromptLoader:
                             ]
                         )
                         messages[1] = Message(role="assistant", content=label)
-                        tokens, mask = self.tokenizer(
+                        tokens = self.tokenizer(
                             {"messages": messages}, inference=False
-                        ).values()
+                        )["tokens"]
                         example_tokens.append(tokens)
-                        example_mask.append(mask)
 
                     sample_tokens.append(example_tokens)
-                    sample_mask.append(example_mask)
                     sample_prompt.append(example_prompt)
                 # We save the individual dataset to disk and add it to the dataset list
                 dataset = Dataset.from_dict(
                     {
                         "tokens": sample_tokens,
-                        "mask": sample_mask,
                         "prompt": sample_prompt,
                     }
                 )
