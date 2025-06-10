@@ -23,10 +23,9 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from torchtune.generation import generate
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from torchtune import config, modules, training, utils
+from torchtune import config, modules, training, utils, generation
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
 from torchtune.datasets import ConcatDataset
@@ -186,6 +185,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
         else:
             self.dp_degree, self.dp_rank = 1, 0
+
+        # Add timestamp to checkpoint
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            cfg.checkpointer.output_dir = cfg.checkpointer.output_dir + f"_{timestamp}"
+            cfg.output_dir = cfg.output_dir + f"_{timestamp}"
+        except AttributeError:
+            pass
 
         # Logging attributes
         self._output_dir = cfg.output_dir
@@ -873,13 +880,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ).sum()
 
                 # Compute loss
+
+                # self.generate(
+                #     prompts=batch["prompt"],
+                #     labels=batch["generation_label"],
+                #     sample_count=batch["sample_count"].tolist(),
+                #     batch_idx=batch_idx,
+                # )
                 val_loss = self._loss_step(batch, mode="val") * current_num_tokens
-                self.generate(
-                    prompts=batch["prompt"],
-                    labels=batch["generation_label"],
-                    sample_count=batch["sample_count"].tolist(),
-                    batch_idx=batch_idx,
-                )
 
                 total_val_loss += val_loss
                 total_val_tokens += current_num_tokens
@@ -1108,7 +1116,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
-            self._metric_logger.log({"sample_table": self.sample_table})
+            self._metric_logger.log({"sample_table": self.sample_table}, step=self.global_step)
             self._logger.info("Training completed. Logged sample table...")
             self._metric_logger.close()
         destroy_process_group()
@@ -1172,7 +1180,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         #         decoder_max_seq_len=prompts.shape[1] + labels.shape[1],
         #     )
 
-        predictions = generate(
+        predictions = generation.generate(
             prompt=prompts,
             model=self._model,
             max_generated_tokens=labels.shape[1],

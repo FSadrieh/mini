@@ -64,6 +64,12 @@ BAD_TASKS = [
     "discofuse",
     "turk",
     "e2e_nlg_cleaned",
+    "cord19",
+    "qed",
+    "hate_speech18",
+    "samsum",
+    "sem_eval_2014_task_1",
+    "squad_v2",
 ]
 
 
@@ -317,67 +323,80 @@ class PromptLoader:
         for dataset_ids, templates in tqdm(
             datasets_iterator, desc="Iterating over datasets"
         ):
-            dataset_id, subset = dataset_ids
-            # For debug purposes we only want to load a few datasets
-            if dataset_id in BAD_TASKS or dataset_id not in self.more_tasks:
-                continue
-            if split == "train" and dataset_id in T0_HELDOUT_TASKS:
-                continue
-            elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
-                continue
-            dataset_path = (
-                os.path.join(self.tokenized_data_path, dataset_id, subset)
-                if subset
-                else os.path.join(self.tokenized_data_path, dataset_id)
-            )
-            # We first try to load the dataset from disk if we have tokenized it before
             try:
-                logger.info(f"Processing {dataset_id}...")
-                dataset = Dataset.load_from_disk(dataset_path)
-                logger.info(f"Loaded {dataset_id} dataset from disk.")
-                dataset_list.append(dataset)
-            except OSError:
-                # If this fails we try to load the dataset from the hub
-                try:
-                    dataset = load_dataset(
-                        dataset_id, subset, split=split, trust_remote_code=True
-                    )
-                except Exception:
-                    dataset = load_dataset(dataset_id, subset, split=split)
-                # For each sample in the dataset we apply the templates
-                for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
-                    example_tokens, example_prompt = [], []
-                    for template_id, template in templates.templates.items():
-                        tokens, label = template.apply(sample)
-                        messages = [
-                            Message(role="user", content=tokens, masked=True),
-                            Message(role="assistant", content="", masked=True),
-                        ]
-                        example_prompt.append(
-                            self.tokenizer({"messages": messages}, inference=True)[
-                                "tokens"
-                            ]
-                        )
-                        messages[1] = Message(role="assistant", content=label)
-                        tokens = self.tokenizer(
-                            {"messages": messages}, inference=False
-                        )["tokens"]
-                        example_tokens.append(tokens)
-
-                    sample_tokens.append(example_tokens)
-                    sample_prompt.append(example_prompt)
-                # We save the individual dataset to disk and add it to the dataset list
-                dataset = Dataset.from_dict(
-                    {
-                        "tokens": sample_tokens,
-                        "prompt": sample_prompt,
-                    }
+                dataset_id, subset = dataset_ids
+                # For debug purposes we only want to load a few datasets
+                if dataset_id in BAD_TASKS:
+                    continue
+                if split == "train" and dataset_id in T0_HELDOUT_TASKS:
+                    continue
+                elif split != "train" and dataset_id not in T0_HELDOUT_TASKS:
+                    continue
+                dataset_path = (
+                    os.path.join(self.tokenized_data_path, dataset_id, subset)
+                    if subset
+                    else os.path.join(self.tokenized_data_path, dataset_id)
                 )
-                dataset.save_to_disk(dataset_path)
-                dataset_list.append(dataset)
+                # We first try to load the dataset from disk if we have tokenized it before
+                try:
+                    # logger.info(f"Processing {dataset_id}...")
+                    dataset = Dataset.load_from_disk(dataset_path)
+                    # logger.info(f"Loaded {dataset_id} dataset from disk.")
+                    dataset_list.append(dataset)
+                except OSError:
+                    # If this fails we try to load the dataset from the hub
+                    try:
+                        dataset = load_dataset(
+                            dataset_id, subset, split=split, trust_remote_code=True
+                        )
+                    except Exception:
+                        dataset = load_dataset(dataset_id, subset, split=split)
+                    # For each sample in the dataset we apply the templates
+
+                    # Only take 10.000 random examples per dataset
+                    if split == "train" and len(dataset) > 1_000:
+                        dataset = dataset.shuffle(seed=self.seed).select(range(1_000))
+                    for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
+                        example_tokens, example_prompt = [], []
+                        for template_id, template in templates.templates.items():
+                            tokens, label = template.apply(sample)
+                            messages = [
+                                Message(role="user", content=tokens, masked=True),
+                                Message(role="assistant", content="", masked=True),
+                            ]
+                            example_prompt.append(
+                                self.tokenizer({"messages": messages}, inference=True)[
+                                    "tokens"
+                                ]
+                            )
+                            messages[1] = Message(role="assistant", content=label)
+                            tokens = self.tokenizer(
+                                {"messages": messages}, inference=False
+                            )["tokens"]
+                            example_tokens.append(tokens)
+
+                        sample_tokens.append(example_tokens)
+                        sample_prompt.append(example_prompt)
+                    # We save the individual dataset to disk and add it to the dataset list
+                    dataset = Dataset.from_dict(
+                        {
+                            "tokens": sample_tokens,
+                            "prompt": sample_prompt,
+                        }
+                    )
+                    dataset.save_to_disk(dataset_path)
+                    dataset_list.append(dataset)
+                    sample_tokens = []
+                    sample_prompt = []
+            except Exception as e:
+                logger.error(f"Error processing dataset {dataset_id}: {e}")
+                sample_tokens = []
+                sample_prompt = []
+                continue
 
         # We merge all datasets, shuffle them and save them to disk
         full_dataset = datasets.concatenate_datasets(dataset_list)
+        del dataset_list
         full_dataset = full_dataset.shuffle(seed=self.seed)
         full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))
         return full_dataset
