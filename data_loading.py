@@ -147,6 +147,11 @@ class CustomDataLoader:
 
     def get_collator(self):
         def collate(examples):
+            if "templates" in examples[0]["batches"]:
+                templates = examples[0]["batches"].pop("templates")
+                batch = {k: torch.tensor(v) for k, v in examples[0]["batches"].items()}
+                batch["templates"] = templates
+                return batch
             return {k: torch.tensor(v) for k, v in examples[0]["batches"].items()}
 
         return collate
@@ -207,8 +212,54 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
         batch_generation_label = []
         batch_prompt = []
         batch_counter = []
-        for sample_tokens, sample_prompt in zip(
-            examples["tokens"], examples["prompt"]
+        batch_templates = []
+
+        include_templates = "templates" in examples
+
+        def _flush_batch():
+            # We find the maximum length in the batch and pad the input
+            tokens = padding_helper(
+                batch_tokens,
+                pad_right=True,
+                pad_id=tokenizer.special_tokens["<|finetune_right_pad_id|>"],
+            )
+            prompt = padding_helper(batch_prompt, pad_right=False)
+            generation_label = padding_helper(batch_generation_label, pad_right=True)
+            labels = torch.cat(
+                [
+                    tokens[:, 1:],
+                    torch.full(
+                        (tokens.size(0), 1),
+                        fill_value=-100,
+                        dtype=tokens.dtype,
+                        device=tokens.device,
+                    ),
+                ],
+                dim=-1,
+            )
+
+            labels[
+                labels == tokenizer.special_tokens["<|finetune_right_pad_id|>"]
+            ] = -100
+            labels[labels == tokenizer.eos_id] = -100
+
+            batch = {
+                "tokens": tokens.long(),
+                "labels": labels.long(),
+                "sample_count": batch_counter,
+                "prompt": prompt.long(),
+                "generation_label": generation_label.long(),
+            }
+            if include_templates:
+                batch["templates"] = batch_templates
+            batches.append(batch)
+
+        for sample_tokens, sample_prompt, sample_templates in zip(
+            examples["tokens"],
+            examples["prompt"],
+            examples.get("templates", [])
+            if include_templates
+            else [None] * len(examples["tokens"]),
         ):
             # If we have more examples for a give input than micro batch size we can not leave them in one batch
             if len(sample_tokens) > batch_size:
@@ -218,47 +269,15 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
 
             # If the examples of the next sample would not fit in the batch we create a new batch
             if len(batch_tokens) + len(sample_tokens) > batch_size:
-                # We find the maximum length in the batch and pad the input
-                tokens = padding_helper(batch_tokens, pad_right=True, pad_id = tokenizer.special_tokens["<|finetune_right_pad_id|>"])
-                prompt = padding_helper(batch_prompt, pad_right=False)
-                generation_label = padding_helper(
-                    batch_generation_label, pad_right=True
-                )
-                labels = torch.cat(
-                    [
-                        tokens[:, 1:],
-                        torch.full(
-                            (tokens.size(0), 1),
-                            fill_value=-100,
-                            dtype=tokens.dtype,
-                            device=tokens.device,
-                        ),
-                    ],
-                    dim=-1,
-                )
-
-                labels[labels == tokenizer.special_tokens["<|finetune_right_pad_id|>"]] = -100
-                labels[labels == tokenizer.eos_id] = -100
-
-
-                batches.append(
-                    {
-                        "tokens": tokens.long(),
-                        "labels": labels.long(),
-                        "sample_count": batch_counter,
-                        "prompt": prompt.long(),
-                        "generation_label": generation_label.long(),
-                    }
-                )
+                _flush_batch()
                 # Reset everything for the next batch
                 batch_tokens = []
                 batch_prompt = []
                 batch_generation_label = []
                 batch_counter = []
+                batch_templates = []
 
-            for example_tokens, example_prompt in zip(
-                sample_tokens, sample_prompt
-            ):
+            for example_tokens, example_prompt in zip(sample_tokens, sample_prompt):
                 # We append each example to the batch
                 generation_label = example_tokens[
                     len(example_prompt) :
@@ -273,6 +292,9 @@ def make_preprocess_function(batch_size: int, tokenizer: PreTrainedTokenizerFast
 
             # For each samples we append how many examples it has
             batch_counter.append(len(sample_tokens))
+
+            if include_templates:
+                batch_templates.extend(sample_templates)
 
         return {"batches": batches}
 
@@ -300,12 +322,12 @@ class PromptLoader:
         ]
 
         self.more_tasks = [
-                "blbooksgenre",
-                "hellaswag",
-                "newspop",
-                "winogrande",
-                "wiqa",
-            ]
+            "blbooksgenre",
+            "hellaswag",
+            "newspop",
+            "winogrande",
+            "wiqa",
+        ]
 
     def iterate_prompts(self, split: str = "train") -> Iterator[Tuple[str, str]]:
         datasets_iterator = self.collection.datasets_templates.items()
@@ -319,6 +341,7 @@ class PromptLoader:
 
         sample_prompt = []
         sample_tokens = []
+        template_list = []
         dataset_list = []
         for dataset_ids, templates in tqdm(
             datasets_iterator, desc="Iterating over datasets"
@@ -339,6 +362,7 @@ class PromptLoader:
                 )
                 # We first try to load the dataset from disk if we have tokenized it before
                 try:
+                    raise OSError  # Force to load from hub
                     # logger.info(f"Processing {dataset_id}...")
                     dataset = Dataset.load_from_disk(dataset_path)
                     # logger.info(f"Loaded {dataset_id} dataset from disk.")
@@ -357,7 +381,7 @@ class PromptLoader:
                     if split == "train" and len(dataset) > 1_000:
                         dataset = dataset.shuffle(seed=self.seed).select(range(1_000))
                     for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
-                        example_tokens, example_prompt = [], []
+                        example_tokens, example_prompt, template_ids = [], [], []
                         for template_id, template in templates.templates.items():
                             tokens, label = template.apply(sample)
                             messages = [
@@ -374,24 +398,39 @@ class PromptLoader:
                                 {"messages": messages}, inference=False
                             )["tokens"]
                             example_tokens.append(tokens)
+                            template_ids.append(template_id)
 
                         sample_tokens.append(example_tokens)
                         sample_prompt.append(example_prompt)
+                        template_list.append(
+                            [
+                                dataset_id + (f"_{subset}" if subset else "") + t
+                                for t in template_ids
+                            ]
+                        )
                     # We save the individual dataset to disk and add it to the dataset list
                     dataset = Dataset.from_dict(
                         {
                             "tokens": sample_tokens,
                             "prompt": sample_prompt,
                         }
+                        if split == "train"
+                        else {
+                            "tokens": sample_tokens,
+                            "prompt": sample_prompt,
+                            "templates": template_list,
+                        }
                     )
                     dataset.save_to_disk(dataset_path)
                     dataset_list.append(dataset)
                     sample_tokens = []
                     sample_prompt = []
+                    template_list = []
             except Exception as e:
                 logger.error(f"Error processing dataset {dataset_id}: {e}")
                 sample_tokens = []
                 sample_prompt = []
+                template_list = []
                 continue
 
         # We merge all datasets, shuffle them and save them to disk

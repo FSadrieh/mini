@@ -218,9 +218,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._enable_fp8_training = cfg.get("enable_fp8_training", False)
         self._fp8_recipe_name = cfg.get("fp8_recipe_name", None)
 
-        self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
-        self._eval_batches = cfg.get("eval_batches", 0)
-
         # Optimizer in backward is not compatible with gradient accumulation or gradient clipping
         if self._optimizer_in_bwd:
             if self._clip_grad_norm is not None:
@@ -281,6 +278,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.global_step = 0
 
         ### My code ###
+        self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
+        self._eval_batches = cfg.get("eval_batches", 0)
         self.sample_table = wandb.Table(
             columns=["timestep", "prompt", "pred", "label", "em", "f1"]
         )
@@ -806,9 +805,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         return dataloader
 
-    def _loss_step(self, batch: dict[str, torch.Tensor], mode="train") -> torch.Tensor:
+    def _loss_step(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor]:
         # Shape [b, s], needed for the loss not the model
-        labels = batch.pop("labels")
+        labels = batch["labels"]
 
         with self.activations_handling_ctx:
             outputs = self._model(tokens=batch["tokens"])
@@ -823,42 +822,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Compute loss
         loss = self._loss_fn(outputs, labels)
 
-        # Compute accuracy
+        # Compute accuracy and custom losses
         logits = self._model.output(outputs)
         custom_losses = self.calculate_loss(
             logits, labels, batch["sample_count"].tolist()
         )
-        predictions = torch.argmax(logits, axis=-1).view(-1)
-        mask = labels.view(-1).ne(-100)
-        accuracy = self.acc_metric.compute(
-            predictions=predictions[mask], references=labels.view(-1)[mask]
-        )["accuracy"]
 
-        if self._is_rank_zero:
-            log_dict = {
-                f"{mode}/accuracy": accuracy,
-                f"{mode}/loss": loss.item(),
-                f"{mode}/mean_loss": custom_losses["mean"],
-                f"{mode}/sum_loss": custom_losses["sum"],
-                f"{mode}/distance_loss": custom_losses["distance"],
-                f"{mode}/var_loss": custom_losses["variance"],
-            }
-            if mode == "val":
-                self.ppl.update(
-                    logits,
-                    labels,
-                )
-                log_dict[f"{mode}/ppl"] = self.ppl.compute().item()
-
-            self._metric_logger.log_dict(
-                log_dict,
-                step=self.global_step,
-            )
-
-        # free logits otherwise it peaks backward memory
         del outputs
-
-        return loss
+        return loss, custom_losses, logits
 
     def validate(self) -> dict[str, float]:
         """
@@ -887,7 +858,34 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 #     sample_count=batch["sample_count"].tolist(),
                 #     batch_idx=batch_idx,
                 # )
-                val_loss = self._loss_step(batch, mode="val") * current_num_tokens
+                val_loss, custom_losses, logits = self._loss_step(batch)
+                val_loss *= current_num_tokens
+                self.ppl.update(
+                    logits,
+                    batch["labels"],
+                )
+                predictions = torch.argmax(logits, axis=-1).view(-1)
+                mask = batch["labels"].view(-1).ne(-100)
+                custom_losses["accuracy"] = self.acc_metric.compute(
+                    predictions=predictions[mask],
+                    references=batch["labels"].view(-1)[mask],
+                )["accuracy"]
+
+                if self._is_rank_zero:
+                    log_dict = {
+                        "val/accuracy": custom_losses["accuracy"],
+                        "val/loss": val_loss.item(),
+                        "val/mean_loss": custom_losses["mean"],
+                        "val/sum_loss": custom_losses["sum"],
+                        "val/distance_loss": custom_losses["distance"],
+                        "val/var_loss": custom_losses["variance"],
+                        "val/ppl": self.ppl.compute().item(),
+                    }
+
+                    self._metric_logger.log_dict(
+                        log_dict,
+                        step=self.global_step,
+                    )
 
                 total_val_loss += val_loss
                 total_val_tokens += current_num_tokens
@@ -966,7 +964,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                current_loss = self._loss_step(batch) * current_num_tokens
+                current_loss, custom_losses, __ = self._loss_step(batch)
+                current_loss *= current_num_tokens
                 running_loss += current_loss
 
                 # For optimizer in backward, we need to normalize before calling backward
@@ -1033,7 +1032,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
-                            "loss": loss_to_log,
+                            "train/loss": loss_to_log,
+                            "train/mean_loss": custom_losses["mean"],
+                            "train/sum_loss": custom_losses["sum"],
+                            "train/distance_loss": custom_losses["distance"],
+                            "train/var_loss": custom_losses["variance"],
+                            "train/accuracy": custom_losses["accuracy"],
                             "lr": get_lr(
                                 (
                                     self._optimizer
@@ -1116,7 +1120,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
-            self._metric_logger.log({"sample_table": self.sample_table}, step=self.global_step)
+            self._metric_logger.log(
+                {"sample_table": self.sample_table}, step=self.global_step
+            )
             self._logger.info("Training completed. Logged sample table...")
             self._metric_logger.close()
         destroy_process_group()
@@ -1285,11 +1291,11 @@ def recipe_main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     current_process_rank = get_rank()
-    # port = 56789
-    # if current_process_rank == 0:
-    #     debugpy.listen(("0.0.0.0", port))
-    #     print(
-    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-    #     )
-    #     debugpy.wait_for_client()
+    port = 56789
+    if current_process_rank == 0:
+        debugpy.listen(("0.0.0.0", port))
+        print(
+            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+        )
+        debugpy.wait_for_client()
     sys.exit(recipe_main())
