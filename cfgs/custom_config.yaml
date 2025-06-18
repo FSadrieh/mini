@@ -115,3 +115,8 @@ profiler:
   warmup_steps: 3
   active_steps: 2
   num_cycles: 1
+
+# Generation params
+temperature: 0.6 # 0.8 and 0.6 are popular values to try
+top_k: 300
+enable_kv_cache: True

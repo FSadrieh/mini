@@ -14,8 +14,7 @@ from typing import Any, Optional, Union
 from warnings import warn
 
 import torch
-from omegaconf import DictConfig, ListConfig
-from statistics import fmean
+from omegaconf import DictConfig
 
 from torch import nn
 from torch.distributed import destroy_process_group, init_process_group
@@ -24,13 +23,10 @@ from torch.distributed.tensor.parallel import parallelize_module
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader import StatefulDataLoader
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from torchtune import config, modules, training, utils, generation
-from torchtune.config._utils import _get_component_from_path
-from torchtune.data import padded_collate_packed
-from torchtune.datasets import ConcatDataset
+from torchtune import config, modules, training, utils
 from torchtune.modules.embedding_utils import resize_token_embeddings
 from torchtune.modules.loss import SFTLoss
+from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
     DummyProfiler,
@@ -56,6 +52,8 @@ from torchmetrics import Accuracy
 from torchmetrics.text import ROUGEScore, BLEUScore, SQuAD, Perplexity
 
 from data_loading import CustomDataLoader
+
+from generate import InferenceRecipe
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -167,6 +165,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             raise ValueError(
                 "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
             )
+        if self.tp_degree > 1:
+            # DTensor does not support grouped_mm yet
+            moe_utils.use_grouped_mm = False
+        self.cp_degree = cfg.get("context_parallel_dim", 1)
         data_shard = cfg.get("data_parallel_shard_dim", -1)  # -1 means to infer
         data_replicate = cfg.get("data_parallel_replicate_dim", 1)
 
@@ -175,6 +177,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             dp_replicate=data_replicate,
             dp_shard=data_shard,
             tp=self.tp_degree,
+            cp=self.cp_degree,
             world_size=self.world_size,
         )
         self.world_mesh = self.parallel_dims.build_mesh(device_type=device_type)
@@ -242,7 +245,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._activation_offloading_use_streams = cfg.get(
             "activation_offloading_use_streams", True
         )
-        if self._activation_offloading_use_streams and self.parallel_dims.tp_enabled:
+        if (
+            self._enable_activation_offloading
+            and self._activation_offloading_use_streams
+            and self.parallel_dims.tp_enabled
+        ):
             warn(
                 message=(
                     "Using activation offloading with streams is not advised in tensor parallel, and may "
@@ -302,6 +309,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         ).to(self._device)
 
         self.custom_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+
+        self.generator = InferenceRecipe(
+            cfg=cfg,
+            device=self._device,
+            dtype=self._dtype,
+            seed=self.seed,
+        )
+        self.current_checkpoint_dir = cfg.checkpointer.checkpoint_dir
 
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
         """
@@ -374,6 +389,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._compile_loss = compile.get("loss", True)
             self._compile_optimizer_step = compile.get("optimizer_step", False)
             self._compile_scale_grads = compile.get("scale_grads", True)
+        if self._compile_model:
+            # Capture scalar outputs is required to compile MoE
+            torch._dynamo.config.capture_scalar_outputs = True
 
         # This indirection is needed to apply torch.compile to scale_grads step.
         self._grad_scaler = training.scale_grads_
@@ -395,6 +413,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             ac_option=cfg.get("ac_option", None),
         )
         self._tokenizer = config.instantiate(cfg.tokenizer)
+
+        self.generator._tokenizer = self._tokenizer
 
         if cfg.get("resize_token_embeddings", False):
             resize_token_embeddings(self._model, self._tokenizer.vocab_size)
@@ -486,6 +506,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._steps_per_epoch = (
             len(self._dataloader) // self._gradient_accumulation_steps
         )
+ 
         if (
             self.max_steps_per_epoch is not None
             and self.max_steps_per_epoch < self._steps_per_epoch
@@ -503,13 +524,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
-
-        # Used to ignore labels for loss computation
-        bsz_cache = (
-            cfg.batch_size
-            if self._val_dataloader is None
-            else max(cfg.batch_size, self._val_dataloader.batch_size)
-        )
 
         self.acc = Accuracy(
             task="multiclass",
@@ -644,6 +658,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     "FP8 training does not support tensor parallelism yet. "
                     "This will be enabled in the near future."
                 )
+            if self.cp_degree > 1:
+                raise ValueError(
+                    "Context Parallel for fp8 training is not currently supported"
+                )
             model = convert_to_float8_training(model, self._fp8_recipe_name)
 
         # Apply tensor parallelism to the model
@@ -705,6 +723,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 reshard_after_forward=reshard_after_forward,
                 dp_mesh=self.world_mesh[dp_mesh_dim_names],
             )
+
+        # Define context manager for context parallelism
+        self.context_parallel_manager = training.get_context_parallel_manager(
+            enabled=self.cp_degree > 1,
+            world_mesh=self.world_mesh,
+            model=model,
+        )
 
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
@@ -856,8 +881,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         running_metrics = {}
         self.acc_per_prompt = {}
 
+        should_generate = self.generator.setup(self.current_checkpoint_dir)
+
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self._val_dataloader):
+            for batch_idx, batch in tqdm(enumerate(self._val_dataloader), disable=not self._is_rank_zero, desc="Validating", total=self._eval_batches):
                 if batch_idx >= self._eval_batches:
                     continue
 
@@ -885,6 +912,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 )
 
                 running_metrics = self.log_metrics_over_epoch(metrics, running_metrics)
+
+                if should_generate:
+                    self.generate(batch, templates, batch_idx)
 
         # Aggregate validation metrics across all ranks
         metrics = self.calculate_total_metrics(running_metrics)
@@ -963,26 +993,26 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 utils.batch_to_device(batch, self._device)
 
-                metrics, __ = self._loss_step(batch)
-
-                # Calculate the number of unmasked tokens in the current batch
-                # and increment the total number of tokens seen in the step
-                metrics["current_num_tokens"] = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
-
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                current_loss *= metrics["current_num_tokens"]
+                with self.context_parallel_manager(list(batch.values())):
+                    metrics, __ = self._loss_step(batch)
 
-                # For optimizer in backward, we need to normalize before calling backward
-                # This case and gradient accumulation are mutually exclusive
-                if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(metrics["current_num_tokens"])
-                    torch.distributed.all_reduce(running_loss)
-                    current_loss = current_loss * (self.dp_degree / metrics["current_num_tokens"])
+                    # Calculate the number of unmasked tokens in the current batch
+                    # and increment the total number of tokens seen in the step
+                    metrics["current_num_tokens"] = (
+                        batch["labels"] != self._loss_fn.ignore_index
+                    ).sum()
+                    current_loss *= metrics["current_num_tokens"]
 
-                current_loss.backward()
+                    # For optimizer in backward, we need to normalize before calling backward
+                    # This case and gradient accumulation are mutually exclusive
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(metrics["current_num_tokens"])
+                        torch.distributed.all_reduce(running_loss)
+                        current_loss = current_loss * (self.dp_degree / metrics["current_num_tokens"])
+                    current_loss.backward()
+
                 running_metrics = self.log_metrics_over_epoch(
                     metrics,
                     running_metrics,
@@ -1127,6 +1157,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ),
                 epoch=curr_epoch,
             )
+            # After saving the checkpoint, we can safely update the current checkpoint directory
+            self.current_checkpoint_dir = self._output_dir + f"epoch_{curr_epoch}"
 
         self._profiler.stop()
 
@@ -1159,7 +1191,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "variance": sum(torch.var(losses) for losses in per_group_loss)
             / len(per_group_loss),
             "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
-            "mean": total_mean_loss.item(),
+            "mean": total_mean_loss,
         }
 
     def log_metrics_over_epoch(
@@ -1192,22 +1224,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
         return total_metrics
 
-    def generate(self, prompts, labels, sample_count, batch_idx):
+    def generate(self, batch, templates, batch_idx):
         """
         Generate while training to log EM and F1 scores.
         """
+        prompts = batch["prompt"]
+        labels = batch["generation_label"]
 
-        predictions = generation.generate(
-            prompt=prompts,
-            model=self._model,
-            max_generated_tokens=labels.shape[1],
-            pad_id=self._tokenizer.pad_id,
-            temperature=0.6,
-            top_k=300,
-            stop_tokens=self._tokenizer.stop_tokens,
-        )[0]
-        predictions = predictions[:, prompts.shape[-1] :]
-
+        predictions = self.generator.generate(
+            prompts=prompts,
+            max_len=labels.shape[1],
+        )
+        # predictions = predictions[:, prompts.shape[-1] :]
+        self.per_prompt_acc(predictions[:, prompts.shape[-1] :], labels, templates)
         # Decode labels and predictions
         pred_text = [
             self._tokenizer.decode(prediction, truncate_at_eos=True)
@@ -1225,28 +1254,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         squad_pred = [
             {"id": str(i), "prediction_text": text} for i, text in enumerate(pred_text)
         ]
-        metrics = self.squad_metric.compute(
-            predictions=squad_pred, references=squad_label
+        self.squad.update(
+            preds=squad_pred,
+            target=squad_label,
         )
-        bleu_score = self.bleu.compute(predictions=pred_text, references=label_text)[
-            "bleu"
-        ]
-        rouge_score = self.rouge.compute(predictions=pred_text, references=label_text)[
-            "rougeL"
-        ]
-        # bert_score = self.bertscore.compute(predictions=pred_text, references=label_text, lang="en")
-
-        if self._is_rank_zero:
-            self._metric_logger.log_dict(
-                {
-                    "val/em": metrics["exact_match"],
-                    "val/f1": metrics["f1"],
-                    "val/bleu": bleu_score,
-                    "val/rouge": rouge_score,
-                    # "val/bert_score": fmean(bert_score["f1"]),
-                },
-                step=self.global_step,
-            )
+        self.rouge.update(
+            preds=pred_text,
+            target=label_text,
+        )
+        self.bleu.update(
+            preds=pred_text,
+            target=label_text,
+        )
 
         if batch_idx == 0:
             prompts = [
@@ -1256,10 +1275,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._logger.info(
                 f"Generated example:\nPrompt:\n{prompts[0]}\nPred:{pred_text[0]}\nLabel:{label_text[0]}"
             )
-            for i in range(sample_count[0]):
-                individual_metrics = self.squad_metric.compute(
-                    predictions=[squad_pred[i]], references=[squad_label[i]]
+            for i in range(batch["sample_count"][0].item()):
+                self.individual_squad.reset()
+                self.individual_squad.update(
+                    preds=[squad_pred[i]], target=[squad_label[i]]
                 )
+                individual_metrics = self.individual_squad.compute()
                 self.sample_table.add_data(
                     self.global_step,
                     prompts[i],
