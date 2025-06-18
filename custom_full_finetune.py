@@ -35,13 +35,8 @@ from torchtune.training.checkpointing._checkpoint_client import (
 from torchtune.training.lr_schedulers import get_lr
 
 from tqdm import tqdm
-from torchmetrics import (
-    Perplexity,
-    SQuAD,
-    BLEUScore,
-    Accuracy,
-)
-from torchmetrics.text import ROUGEScore
+from torchmetrics import Accuracy
+from torchmetrics.text import ROUGEScore, BLEUScore, SQuAD, Perplexity
 from data_loading import CustomDataLoader
 import datetime
 import wandb
@@ -675,7 +670,6 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             and self.global_step % self._run_val_every_n_steps == 0
         ):
             self.validate()
-            self.ppl.reset()
 
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch)
@@ -731,26 +725,26 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                         self.lr_scheduler.step()
 
                     self.global_step += 1
-                    metrics = self.calculate_total_metrics(
+                    total_metrics = self.calculate_total_metrics(
                         running_metrics,
                         loss_factor=None if not self.optimizer_in_bwd else 1.0,
                     )
                     pbar.update(1)
                     pbar.set_description(
-                        f"{curr_epoch + 1}|{self.global_step}|Loss: {metrics['loss']:.4f}"
+                        f"{curr_epoch + 1}|{self.global_step}|Loss: {total_metrics['loss']:.4f}"
                     )
 
                     if self.global_step % self._log_every_n_steps == 0:
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
-                            "train/loss": metrics["loss"],
-                            "train/mean_loss": metrics["mean"],
-                            "train/sum_loss": metrics["sum"],
-                            "train/distance_loss": metrics["distance"],
-                            "train/var_loss": metrics["variance"],
+                            "train/loss": total_metrics["loss"],
+                            "train/mean_loss": total_metrics["mean"],
+                            "train/sum_loss": total_metrics["sum"],
+                            "train/distance_loss": total_metrics["distance"],
+                            "train/var_loss": total_metrics["variance"],
                             "lr": get_lr(self.optimizer),
                             "tokens_per_second_per_gpu": (
-                                metrics["current_num_tokens"] / time_per_step
+                                total_metrics["current_num_tokens"] / time_per_step
                             ),
                         }
                         if self._device.type != "cpu" and self._log_peak_memory_stats:
@@ -795,7 +789,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._profiler.stop()
 
     def cleanup(self) -> None:
-        self._metric_logger.log(
+        self._metric_logger.log_dict(
             {"sample_table": self.sample_table}, step=self.global_step
         )
         self._metric_logger.close()
@@ -848,8 +842,8 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 total_metrics[key] = value
                 continue
             total_metrics[key] = (
-                value / metrics["current_num_tokens"]
-                if metrics["current_num_tokens"] > 0
+                value / loss_factor
+                if loss_factor > 0
                 else float("inf")
             )
         return total_metrics
@@ -942,7 +936,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             self._logger.info(
                 f"Generated example:\nPrompt:\n{prompts[0]}\nPred:{pred_text[0]}\nLabel:{label_text[0]}"
             )
-            for i in range(batch["sample_count"].item()):
+            for i in range(batch["sample_count"][0].item()):
                 self.individual_squad.reset()
                 self.individual_squad.update(
                     preds=[squad_pred[i]], target=[squad_label[i]]
@@ -985,7 +979,7 @@ def recipe_main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    port = 56789
+    # port = 56789
     # debugpy.listen(("0.0.0.0", port))
     # print(
     #     f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."

@@ -52,7 +52,8 @@ from tqdm import tqdm
 import wandb
 from evaluate import load
 import datetime
-from torchmetrics.text import Perplexity
+from torchmetrics import Accuracy
+from torchmetrics.text import ROUGEScore, BLEUScore, SQuAD, Perplexity
 
 from data_loading import CustomDataLoader
 
@@ -283,11 +284,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.sample_table = wandb.Table(
             columns=["timestep", "prompt", "pred", "label", "em", "f1"]
         )
-        self.acc_metric = load("accuracy")
-        self.squad_metric = load("squad")
-        self.bertscore = load("bertscore")
-        self.bleu = load("bleu")
-        self.rouge = load("rouge")
+        self.acc = None
+        self.squad = SQuAD(
+            dist_sync_on_step=True,
+        ).to(self._device)
+        self.individual_squad = SQuAD(
+            dist_sync_on_step=True,
+        ).to(self._device)
+        self.rouge = ROUGEScore(
+            dist_sync_on_step=True,
+        )
+        self.bleu = BLEUScore(
+            dist_sync_on_step=True,
+        ).to(self._device)
         self.ppl = Perplexity(
             ignore_index=-100, dist_sync_on_step=False, sync_on_compute=False
         ).to(self._device)
@@ -501,6 +510,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             if self._val_dataloader is None
             else max(cfg.batch_size, self._val_dataloader.batch_size)
         )
+
+        self.acc = Accuracy(
+            task="multiclass",
+            num_classes=self._model.tok_embeddings.weight.shape[0],
+            ignore_index=-100,
+            dist_sync_on_step=True,
+        ).to(self._device)
 
     def _setup_lr_scheduler(
         self,
@@ -824,89 +840,81 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Compute accuracy and custom losses
         logits = self._model.output(outputs)
-        custom_losses = self.calculate_loss(
-            logits, labels, batch["sample_count"].tolist()
-        )
+        metrics = self.calculate_loss(logits, labels, batch["sample_count"].tolist())
+        metrics["loss"] = loss
 
         del outputs
-        return loss, custom_losses, logits
+        return metrics, logits
 
     def validate(self) -> dict[str, float]:
         """
         Run validation loop and return average validation loss.
         """
         self._model.eval()
-        total_val_loss = torch.tensor(0.0, device=self._device)
-        total_val_tokens = torch.tensor(0.0, device=self._device)
+        for m in (self.acc, self.bleu, self.squad, self.rouge, self.ppl):
+            m.reset()
+        running_metrics = {}
+        self.acc_per_prompt = {}
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self._val_dataloader):
                 if batch_idx >= self._eval_batches:
                     continue
-                utils.batch_to_device(batch, self._device)
 
-                # Count tokens excluding padding
-                current_num_tokens = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
+                templates = batch.pop("templates", None)
+                utils.batch_to_device(batch, self._device)
 
                 # Compute loss
 
-                # self.generate(
-                #     prompts=batch["prompt"],
-                #     labels=batch["generation_label"],
-                #     sample_count=batch["sample_count"].tolist(),
-                #     batch_idx=batch_idx,
-                # )
-                val_loss, custom_losses, logits = self._loss_step(batch)
-                val_loss *= current_num_tokens
+                metrics, logits = self._loss_step(batch)
+
+                # Count tokens excluding padding
+                metrics["current_num_tokens"] = (
+                    batch["labels"] != self._loss_fn.ignore_index
+                ).sum()
+
                 self.ppl.update(
                     logits,
                     batch["labels"],
                 )
                 predictions = torch.argmax(logits, axis=-1).view(-1)
                 mask = batch["labels"].view(-1).ne(-100)
-                custom_losses["accuracy"] = self.acc_metric.compute(
-                    predictions=predictions[mask],
-                    references=batch["labels"].view(-1)[mask],
-                )["accuracy"]
+                self.acc.update(
+                    preds=predictions[mask],
+                    target=batch["labels"].view(-1)[mask],
+                )
 
-                if self._is_rank_zero:
-                    log_dict = {
-                        "val/accuracy": custom_losses["accuracy"],
-                        "val/loss": val_loss.item(),
-                        "val/mean_loss": custom_losses["mean"],
-                        "val/sum_loss": custom_losses["sum"],
-                        "val/distance_loss": custom_losses["distance"],
-                        "val/var_loss": custom_losses["variance"],
-                        "val/ppl": self.ppl.compute().item(),
-                    }
-
-                    self._metric_logger.log_dict(
-                        log_dict,
-                        step=self.global_step,
-                    )
-
-                total_val_loss += val_loss
-                total_val_tokens += current_num_tokens
+                running_metrics = self.log_metrics_over_epoch(metrics, running_metrics)
 
         # Aggregate validation metrics across all ranks
-        torch.distributed.all_reduce(total_val_loss)
-        torch.distributed.all_reduce(total_val_tokens)
+        metrics = self.calculate_total_metrics(running_metrics)
+        squad_metrics = self.squad.compute()
+        log_dict = {
+            "val/accuracy": self.acc.compute().item(),
+            "val/loss": metrics["loss"],
+            "val/mean_loss": metrics["mean"],
+            "val/sum_loss": metrics["sum"],
+            "val/distance_loss": metrics["distance"],
+            "val/var_loss": metrics["variance"],
+            "val/ppl": self.ppl.compute().item(),
+            "val/exact_match": squad_metrics["exact_match"].item(),
+            "val/f1": squad_metrics["f1"].item(),
+            "val/bleu": self.bleu.compute().item(),
+            **{f"val/{k}": float(v) for k, v in self.rouge.compute().items()},
+        }
 
-        avg_val_loss = (
-            (total_val_loss / total_val_tokens).item()
-            if total_val_tokens > 0
-            else float("inf")
-        )
-        log_dict = {"val/loss": avg_val_loss}
-
-        if self._is_rank_zero:
-            self._logger.info(f"Validation loss: {avg_val_loss:.4f}")
-            self._metric_logger.log_dict(
-                log_dict,
-                step=self.global_step,
+        for prompt, acc in self.acc_per_prompt.items():
+            acc = torch.tensor(acc)
+            num_samples = acc.shape[0]
+            log_dict[f"val/acc_{prompt}"] = (
+                (acc.sum() / num_samples) if num_samples > 0 else 0.0
             )
+
+        self._logger.info(f"Validation loss: {metrics['loss']:.4f}")
+        self._metric_logger.log_dict(
+            log_dict,
+            step=self.global_step,
+        )
 
         self._model.train()
         return log_dict
@@ -937,7 +945,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             and self.global_step % self._run_val_every_n_steps == 0
         ):
             self.validate()
-            self.ppl.reset()
+
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
@@ -955,39 +963,42 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 utils.batch_to_device(batch, self._device)
 
+                metrics, __ = self._loss_step(batch)
+
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
-                current_num_tokens = (
+                metrics["current_num_tokens"] = (
                     batch["labels"] != self._loss_fn.ignore_index
                 ).sum()
-                num_tokens += current_num_tokens
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
-                current_loss, custom_losses, __ = self._loss_step(batch)
-                current_loss *= current_num_tokens
-                running_loss += current_loss
+                current_loss *= metrics["current_num_tokens"]
 
                 # For optimizer in backward, we need to normalize before calling backward
                 # This case and gradient accumulation are mutually exclusive
                 if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(num_tokens)
+                    torch.distributed.all_reduce(metrics["current_num_tokens"])
                     torch.distributed.all_reduce(running_loss)
-                    current_loss = current_loss * (self.dp_degree / num_tokens)
+                    current_loss = current_loss * (self.dp_degree / metrics["current_num_tokens"])
 
                 current_loss.backward()
+                running_metrics = self.log_metrics_over_epoch(
+                    metrics,
+                    running_metrics,
+                )
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(num_tokens)
+                        torch.distributed.all_reduce(metrics["current_num_tokens"])
                         # This will ensure that the logged loss matches what we're optimizing
                         torch.distributed.all_reduce(running_loss)
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
                             self._model.parameters(),
-                            self.world_size / num_tokens,
+                            self.world_size / metrics["current_num_tokens"],
                             False if self.parallel_dims.tp_enabled else None,
                         )
 
@@ -1019,10 +1030,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         precompute_float8_dynamic_scale_for_fsdp(self._model)
 
-                    loss_to_log = running_loss.detach().item() / num_tokens
+                    total_metrics = self.calculate_total_metrics(
+                        running_metrics,
+                        loss_factor=None if not self.optimizer_in_bwd else 1.0,
+                    )
                     pbar.update(1)
                     pbar.set_description(
-                        f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
+                        f"{curr_epoch + 1}|{self.global_step}|Loss: {total_metrics['loss']}"
                     )
 
                     # Log per-step metrics
@@ -1032,12 +1046,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
-                            "train/loss": loss_to_log,
-                            "train/mean_loss": custom_losses["mean"],
-                            "train/sum_loss": custom_losses["sum"],
-                            "train/distance_loss": custom_losses["distance"],
-                            "train/var_loss": custom_losses["variance"],
-                            "train/accuracy": custom_losses["accuracy"],
+                            "train/loss": total_metrics["loss"],
+                            "train/mean_loss": total_metrics["mean"],
+                            "train/sum_loss": total_metrics["sum"],
+                            "train/distance_loss": total_metrics["distance"],
+                            "train/var_loss": total_metrics["variance"],
                             "lr": get_lr(
                                 (
                                     self._optimizer
@@ -1091,7 +1104,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         pbar.refresh()
                         self.validate()
-                        self.ppl.reset()
 
                 if (
                     (idx + 1) // self._gradient_accumulation_steps
@@ -1120,7 +1132,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
-            self._metric_logger.log(
+            self._metric_logger.log_dict(
                 {"sample_table": self.sample_table}, step=self.global_step
             )
             self._logger.info("Training completed. Logged sample table...")
@@ -1150,41 +1162,40 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "mean": total_mean_loss.item(),
         }
 
+    def log_metrics_over_epoch(
+        self,
+        new_metrics: dict[str, float],
+        running_metrics: dict[str, float],
+    ) -> dict[str, float]:
+        for key, value in new_metrics.items():
+            if key not in running_metrics:
+                running_metrics[key] = torch.tensor(0.0, device=self._device)
+            if key == "current_num_tokens":
+                running_metrics[key] += value
+            else:
+                running_metrics[key] += value.detach().float() * new_metrics["current_num_tokens"]
+
+        return running_metrics
+
+    def calculate_total_metrics(
+        self, metrics: dict[str, float]
+    ) -> dict[str, float]:
+        total_metrics = {}
+        for key, value in metrics.items():
+            if key == "current_num_tokens":
+                total_metrics[key] = value
+                continue
+            total_metrics[key] = (
+                value / metrics["current_num_tokens"]
+                if metrics["current_num_tokens"] > 0
+                else float("inf")
+            )
+        return total_metrics
+
     def generate(self, prompts, labels, sample_count, batch_idx):
         """
         Generate while training to log EM and F1 scores.
         """
-        # TODO: Do we need to handle prompts seperatly?
-        # predictions = []
-        # for prompt, label in zip(prompts, labels):
-        #     prompt = prompt[prompt != 0]
-        #     label = label[label != -100]
-        #     # with self._device:
-        #     #     self._model.setup_caches(
-        #     #         batch_size=1,
-        #     #         dtype=self._dtype,
-        #     #         decoder_max_seq_len=prompt.numel() + label.shape[0],
-        #     #     )
-        #     predictions.append(
-        #         generate(
-        #             prompt=prompt,
-        #             model=self._model,
-        #             max_generated_tokens=label.shape[0],
-        #             pad_id=0,
-        #             temperature=0.6,
-        #             top_k=300,
-        #             stop_tokens=self._tokenizer.stop_tokens,
-        #         )[0][:, prompt.shape[-1] :]
-        #     )
-        # pred_text = [self._tokenizer.decode(prediction.tolist()[0]) for prediction in predictions]
-
-        # TODO: ValueError: KV-caches for self-attention layers are setup for inference mode, causal masks must be provided! Use the `mask` arg to provide a causal mask.
-        # with self._device:
-        #     self._model.setup_caches(
-        #         batch_size=prompts.shape[0],
-        #         dtype=self._dtype,
-        #         decoder_max_seq_len=prompts.shape[1] + labels.shape[1],
-        #     )
 
         predictions = generation.generate(
             prompt=prompts,
@@ -1257,6 +1268,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     individual_metrics["exact_match"],
                     individual_metrics["f1"],
                 )
+
+    def per_prompt_acc(self, predictions, labels, templates):
+        per_sample_acc = predictions.eq(labels).float().sum(dim=1) / labels.ne(
+            -100
+        ).float().sum(dim=1)
+
+        for prompt_id in templates:
+            if prompt_id not in self.acc_per_prompt:
+                self.acc_per_prompt[prompt_id] = []
+            self.acc_per_prompt[prompt_id].append(per_sample_acc.mean().item())
+
 
 
 def get_rank() -> int:
