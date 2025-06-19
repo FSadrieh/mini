@@ -46,7 +46,6 @@ from torchtune.training.quantization import (
 
 from tqdm import tqdm
 import wandb
-from evaluate import load
 import datetime
 from torchmetrics import Accuracy
 from torchmetrics.text import ROUGEScore, BLEUScore, SQuAD, Perplexity
@@ -876,9 +875,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         for m in (self.acc, self.bleu, self.squad, self.rouge, self.ppl):
             m.reset()
         running_metrics = {}
-        self.acc_per_prompt = {}
+        self.em_per_prompt = {}
 
-        should_generate = self.generator.setup(
+        self.generator.setup(
             self.current_checkpoint_dir, self._tokenizer.pad_id
         )
 
@@ -917,8 +916,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 running_metrics = self.log_metrics_over_epoch(metrics, running_metrics)
 
-                if should_generate:
-                    self.generate(batch, templates, batch_idx)
+                self.generate(batch, templates, batch_idx)
 
         # Aggregate validation metrics across all ranks
         metrics = self.calculate_total_metrics(running_metrics)
@@ -933,22 +931,21 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "val/ppl": self.ppl.compute().item(),
         }
 
-        if should_generate:
-            log_dict.update(
-                {
-                    "val/exact_match": squad_metrics["exact_match"].item(),
-                    "val/f1": squad_metrics["f1"].item(),
-                    "val/bleu": self.bleu.compute().item(),
-                    **{f"val/{k}": float(v) for k, v in self.rouge.compute().items()},
-                }
-            )
+        log_dict.update(
+            {
+                "val/exact_match": squad_metrics["exact_match"].item(),
+                "val/f1": squad_metrics["f1"].item(),
+                "val/bleu": self.bleu.compute().item(),
+                **{f"val/{k}": float(v) for k, v in self.rouge.compute().items()},
+            }
+        )
 
-            for prompt, acc in self.acc_per_prompt.items():
-                acc = torch.tensor(acc)
-                num_samples = acc.shape[0]
-                log_dict[f"acc/{prompt}"] = (
-                    (acc.sum() / num_samples) if num_samples > 0 else 0.0
-                )
+        for prompt, em in self.em_per_prompt.items():
+            em = torch.tensor(em)
+            num_samples = em.shape[0]
+            log_dict[f"em/{prompt}"] = (
+                (em.sum() / num_samples) if num_samples > 0 else 0.0
+            )
 
         self._logger.info(f"Validation loss: {metrics['loss']:.4f}")
         if self._is_rank_zero:
@@ -990,7 +987,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
             pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
-            # self._dataloader.sampler.set_epoch(curr_epoch)
             for idx, batch in enumerate(self._dataloader):
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
@@ -1148,6 +1144,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         and self.global_step % self._run_val_every_n_steps == 0
                     ):
                         pbar.refresh()
+                        self.save_checkpoint(curr_epoch, real_ckpt=False)
                         self.validate()
 
                 if (
@@ -1156,24 +1153,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     break
 
             self.epochs_run += 1
-            self._checkpoint_client.save_checkpoint(
-                model=self._model,
-                optimizer=(
-                    self._optimizer
-                    if not self._optimizer_in_bwd
-                    else self._optim_ckpt_wrapper
-                ),
-                training_progress=TrainingProgress(
-                    seed=self.seed,
-                    epochs_run=self.epochs_run,
-                    total_epochs=self.total_epochs,
-                    max_steps_per_epoch=self.max_steps_per_epoch,
-                    dataloader_state_dict=self._dataloader.state_dict(),
-                ),
-                epoch=curr_epoch,
-            )
-            # After saving the checkpoint, we can safely update the current checkpoint directory
-            self.current_checkpoint_dir = self._output_dir + f"epoch_{curr_epoch}"
+            self.save_checkpoint(curr_epoch)
 
         self._profiler.stop()
 
@@ -1187,6 +1167,31 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         destroy_process_group()
 
     ### HELPER FUNCTIONS ###
+
+    def save_checkpoint(self, curr_epoch: int, real_ckpt: bool = True) -> None:
+        """
+            Saves the current model and optimizer state to a checkpoint.
+            Due to a hacky usage of the library we save the in between epoch checkpoints to 100 + max epochs. This makes saving ca. 10 seconds faster
+        """
+        epoch = curr_epoch if real_ckpt else self.total_epochs + 100
+        self._checkpoint_client.save_checkpoint(
+            model=self._model,
+            optimizer=(
+                self._optimizer
+                if not self._optimizer_in_bwd
+                else self._optim_ckpt_wrapper
+            ),
+            training_progress=TrainingProgress(
+                seed=self.seed,
+                epochs_run=self.epochs_run,
+                total_epochs=self.total_epochs,
+                max_steps_per_epoch=self.max_steps_per_epoch,
+                dataloader_state_dict=self._dataloader.state_dict(),
+            ),
+            epoch=epoch,
+        )
+        # After saving the checkpoint, we can safely update the current checkpoint directory
+        self.current_checkpoint_dir = self._output_dir + f"/epoch_{epoch}"
 
     def calculate_loss(self, logits, labels, sample_count):
         per_token_loss = self.custom_loss(
@@ -1247,7 +1252,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         """
         prompts = batch["prompt"]
         labels = batch["generation_label"]
-
         attention_mask = prompts.ne(self._tokenizer.pad_id).long()
 
         predictions = self.generator.generate(
@@ -1255,7 +1259,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             attention_mask=attention_mask,
             max_len=labels.shape[1],
         )
-        predictions = predictions[:, prompts.shape[-1] :]
+
         # Decode labels and predictions
         pred_text = [
             self._tokenizer.decode(prediction, truncate_at_eos=True)
@@ -1265,6 +1269,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._tokenizer.decode(label, truncate_at_eos=True)
             for label in labels.tolist()
         ]
+
         # Get it into the squad format
         squad_label = [
             {"id": str(i), "answers": {"text": [text], "answer_start": [0]}}
@@ -1273,54 +1278,62 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         squad_pred = [
             {"id": str(i), "prediction_text": text} for i, text in enumerate(pred_text)
         ]
-        self.per_prompt_acc(predictions, labels, templates)
-        self.squad.update(
-            preds=squad_pred,
-            target=squad_label,
-        )
-        self.rouge.update(
-            preds=pred_text,
-            target=label_text,
-        )
-        self.bleu.update(
-            preds=pred_text,
-            target=label_text,
-        )
+        self.get_em_per_prompt(squad_pred, squad_label, templates)
+
+        self.squad.update(preds=squad_pred, target=squad_label)
+        self.bleu.update(preds=pred_text, target=label_text)
+        self.rouge.update(preds=pred_text, target=label_text)
 
         if batch_idx == 0:
-            prompts = [
-                self._tokenizer.decode(prompt, truncate_at_eos=True)
-                for prompt in prompts.tolist()
-            ]
-            self._logger.info(
-                f"Generated example:\nPrompt:\n{prompts[0]}\nPred:{pred_text[0]}\nLabel:{label_text[0]}"
+            self.populate_sample_table(
+                prompts,
+                pred_text,
+                label_text,
+                batch["sample_count"],
+                squad_pred,
+                squad_label,
             )
-            for i in range(batch["sample_count"][0].item()):
-                self.individual_squad.reset()
-                self.individual_squad.update(
-                    preds=[squad_pred[i]], target=[squad_label[i]]
-                )
-                individual_metrics = self.individual_squad.compute()
-                self.sample_table.add_data(
-                    self.global_step,
-                    prompts[i],
-                    pred_text[i],
-                    label_text[i],
-                    individual_metrics["exact_match"],
-                    individual_metrics["f1"],
-                )
 
-    def per_prompt_acc(self, predictions, labels, templates):
-        # Replace label padding with -100
-        labels[labels == self._tokenizer.pad_id] = -100
-        per_sample_acc = predictions.eq(labels).float().sum(dim=1) / labels.ne(
-            -100
-        ).float().sum(dim=1)
+    def get_em_per_prompt(
+        self, squad_pred: list[str], squad_label: list[str], templates: list[str]
+    ):
+        for i, prompt_id in enumerate(templates):
+            self.individual_squad.reset()
+            self.individual_squad.update(preds=[squad_pred[i]], target=[squad_label[i]])
+            if prompt_id not in self.em_per_prompt:
+                self.em_per_prompt[prompt_id] = []
+            self.em_per_prompt[prompt_id].append(
+                self.individual_squad.compute()["exact_match"].item()
+            )
 
-        for prompt_id in templates:
-            if prompt_id not in self.acc_per_prompt:
-                self.acc_per_prompt[prompt_id] = []
-            self.acc_per_prompt[prompt_id].append(per_sample_acc.mean().item())
+    def populate_sample_table(
+        self,
+        prompts: torch.Tensor,
+        pred_text: list[str],
+        label_text: list[str],
+        sample_count: torch.Tensor,
+        squad_pred: list[str],
+        squad_label: list[str],
+    ):
+        prompts = [
+            self._tokenizer.decode(prompt, truncate_at_eos=True)
+            for prompt in prompts.tolist()
+        ]
+        self._logger.info(
+            f"Generated example:\nPrompt:\n{prompts[0]}\nPred:{pred_text[0]}\nLabel:{label_text[0]}"
+        )
+        for i in range(sample_count[0].item()):
+            self.individual_squad.reset()
+            self.individual_squad.update(preds=[squad_pred[i]], target=[squad_label[i]])
+            individual_metrics = self.individual_squad.compute()
+            self.sample_table.add_data(
+                self.global_step,
+                prompts[i],
+                pred_text[i],
+                label_text[i],
+                individual_metrics["exact_match"],
+                individual_metrics["f1"],
+            )
 
 
 def get_rank() -> int:
@@ -1355,11 +1368,11 @@ def recipe_main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     current_process_rank = get_rank()
-    port = 56789
-    if current_process_rank == 0:
-        debugpy.listen(("0.0.0.0", port))
-        print(
-            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-        )
-        debugpy.wait_for_client()
+    # port = 56789
+    # if current_process_rank == 0:
+    #     debugpy.listen(("0.0.0.0", port))
+    #     print(
+    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+    #     )
+    #     debugpy.wait_for_client()
     sys.exit(recipe_main())

@@ -30,14 +30,7 @@ class InferenceRecipe:
         self._dtype = dtype
         self._seed = seed
 
-    def setup(self, checkpoint_dir, pad_token) -> bool:
-        # We do not evaluate a epoch twice
-        if self.checkpoint_dir == checkpoint_dir:
-            logger.info(
-                "Checkpoint directory is already set in the config, skipping generate."
-            )
-            return False
-
+    def setup(self, checkpoint_dir, pad_token):
         set_seed(self._seed)
         self.checkpoint_dir = checkpoint_dir
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -46,11 +39,10 @@ class InferenceRecipe:
         self.model.config.pad_token_id = pad_token
         self.pad_token = pad_token
         self.model.eval()
-        return True
 
     @torch.inference_mode()
     def generate(self, prompts, attention_mask, max_len):
-        return self.model.generate(
+        predictions = self.model.generate(
             input_ids=prompts,
             attention_mask=attention_mask,
             max_new_tokens=max_len,
@@ -59,3 +51,4 @@ class InferenceRecipe:
             top_k=self.cfg.generation.top_k,
             pad_token_id=self.pad_token,
         )
+        return predictions[:, prompts.shape[1]:]
