@@ -35,7 +35,7 @@ seed: 42
 batch_size: 16
 
 # Validation
-run_val_every_n_steps: 128  # Change to an integer to enable validation every N steps
+run_val_every_n_steps: 2048  # Change to an integer to enable validation every N steps
 eval_batches: 512
 batch_size_val: 128
 
@@ -117,6 +117,7 @@ profiler:
   num_cycles: 1
 
 # Generation params
-temperature: 0.6 # 0.8 and 0.6 are popular values to try
-top_k: 300
-enable_kv_cache: True
+generation:
+  temperature: 0.6 # 0.8 and 0.6 are popular values to try
+  top_k: 300
+  do_sample: True

@@ -1,20 +1,9 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-import itertools
-import sys
-import time
-from typing import Any
-
 import torch
 from omegaconf import DictConfig
-from torch import nn
 
-from torchtune import config, generation, training, utils
-from torchtune.data import Message, Role
-from torchtune.training import FullModelTorchTuneCheckpointer
+from torchtune import utils
+
+from transformers import AutoModelForCausalLM, set_seed
 
 logger = utils.get_logger("DEBUG")
 
@@ -38,68 +27,31 @@ class InferenceRecipe:
         self.cfg = cfg
         self._device = device
         self._dtype = dtype
+        set_seed(seed)
 
-        training.set_seed(
-            seed=seed, debug_mode=cfg.get("cudnn_deterministic_mode", None)
-        )
-        self._tokenizer = None
-
-    def setup(self, checkpoint_dir) -> bool:
+    def setup(self, checkpoint_dir, pad_token) -> bool:
         # We do not evaluate a epoch twice
         if self.cfg.checkpointer.checkpoint_dir == checkpoint_dir and "epoch" in checkpoint_dir:
             logger.info(
-                "Checkpoint directory is already set in the config, skipping setup."
+                "Checkpoint directory is already set in the config, skipping generate."
             )
             return False
         self.cfg.checkpointer.checkpoint_dir = checkpoint_dir
-        checkpointer = config.instantiate(self.cfg.checkpointer)
-        ckpt_dict = checkpointer.load_checkpoint()
-
-        with training.set_default_dtype(self._dtype), self._device:
-            self._model = config.instantiate(self.cfg.model)
-
-        self._model.load_state_dict(ckpt_dict[training.MODEL_KEY],)
-
-        # Validate model was loaded in with the expected dtype.
-        training.validate_expected_param_dtype(
-            self._model.named_parameters(), dtype=self._dtype
-        )
-        logger.info(f"Model is initialized with precision {self._dtype}.")
+        self.model = AutoModelForCausalLM.from_pretrained(self.cfg.checkpointer.checkpoint_dir)
+        self.model = self.model.to(self._device, dtype=self._dtype)
+        self.model.config.pad_token_id = pad_token
+        self.pad_token = pad_token
+        self.model.eval()
         return True
 
     @torch.inference_mode()
-    def generate(self, prompts, max_len):
-
-        # Ensure the cache is setup on the right device, with only as many tokens as we need
-        #TODO: KV cache breaks wiht more than one batch, either it is faster 
-        # if self.cfg.enable_kv_cache:
-        #     with self._device:
-        #         self._model.setup_caches(
-        #             batch_size=prompts.size(0),
-        #             dtype=self._dtype,
-        #             decoder_max_seq_len=prompts.size(1) + max_len,
-        #         )
-
-        generated_tokens, _ = generation.generate(
-            model=self._model,
-            prompt=prompts,
-            max_generated_tokens=max_len,
-            pad_id=self._tokenizer.pad_id,
-            temperature=self.cfg.temperature,
-            top_k=self.cfg.top_k,
-            stop_tokens=self._tokenizer.stop_tokens,
+    def generate(self, prompts, attention_mask, max_len):
+        return self.model.generate(
+            input_ids=prompts,
+            attention_mask=attention_mask,
+            max_new_tokens=max_len,
+            do_sample=self.cfg.generation.do_sample,
+            temperature=self.cfg.generation.temperature,
+            top_k=self.cfg.generation.top_k,
+            pad_token_id=self.pad_token,
         )
-        return generated_tokens
-
-
-
-@config.parse
-def main(cfg: DictConfig) -> None:
-    config.log_config(recipe_name="InferenceRecipe", cfg=cfg)
-    recipe = InferenceRecipe(cfg=cfg)
-    recipe.setup(cfg=cfg)
-    recipe.generate(cfg=cfg)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

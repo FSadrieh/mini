@@ -300,7 +300,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         ).to(self._device)
         self.rouge = ROUGEScore(
             dist_sync_on_step=True,
-        )
+        ).to(self._device)
         self.bleu = BLEUScore(
             dist_sync_on_step=True,
         ).to(self._device)
@@ -309,7 +309,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         ).to(self._device)
 
         self.custom_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-
         self.generator = InferenceRecipe(
             cfg=cfg,
             device=self._device,
@@ -414,7 +413,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         self._tokenizer = config.instantiate(cfg.tokenizer)
 
-        self.generator._tokenizer = self._tokenizer
 
         if cfg.get("resize_token_embeddings", False):
             resize_token_embeddings(self._model, self._tokenizer.vocab_size)
@@ -881,12 +879,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         running_metrics = {}
         self.acc_per_prompt = {}
 
-        should_generate = self.generator.setup(self.current_checkpoint_dir)
+        should_generate = self.generator.setup(self.current_checkpoint_dir, self._tokenizer.pad_id)
 
         with torch.no_grad():
             for batch_idx, batch in tqdm(enumerate(self._val_dataloader), disable=not self._is_rank_zero, desc="Validating", total=self._eval_batches):
                 if batch_idx >= self._eval_batches:
-                    continue
+                    break
 
                 templates = batch.pop("templates", None)
                 utils.batch_to_device(batch, self._device)
@@ -936,7 +934,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         for prompt, acc in self.acc_per_prompt.items():
             acc = torch.tensor(acc)
             num_samples = acc.shape[0]
-            log_dict[f"val/acc_{prompt}"] = (
+            log_dict[f"acc/{prompt}"] = (
                 (acc.sum() / num_samples) if num_samples > 0 else 0.0
             )
 
@@ -965,8 +963,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Initialize tokens count and running loss (for grad accumulation)
         t0 = time.perf_counter()
-        running_loss = 0
-        num_tokens = 0
+        running_metrics = {}
 
         self._profiler.start()
         # Validate before training starts
@@ -1003,32 +1000,34 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     metrics["current_num_tokens"] = (
                         batch["labels"] != self._loss_fn.ignore_index
                     ).sum()
-                    current_loss *= metrics["current_num_tokens"]
+                    current_loss = metrics["loss"] * metrics["current_num_tokens"]
+
+                    running_metrics = self.log_metrics_over_epoch(
+                        metrics,
+                        running_metrics,
+                    )
 
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
                     if self._optimizer_in_bwd:
-                        torch.distributed.all_reduce(metrics["current_num_tokens"])
-                        torch.distributed.all_reduce(running_loss)
+                        torch.distributed.all_reduce(running_metrics["current_num_tokens"])
+                        torch.distributed.all_reduce(running_metrics["loss"])
                         current_loss = current_loss * (self.dp_degree / metrics["current_num_tokens"])
                     current_loss.backward()
 
-                running_metrics = self.log_metrics_over_epoch(
-                    metrics,
-                    running_metrics,
-                )
+                
                 # Optimizer step (if not fused in backward call)
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
                     if not self._optimizer_in_bwd:
                         # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(metrics["current_num_tokens"])
+                        torch.distributed.all_reduce(running_metrics["current_num_tokens"])
                         # This will ensure that the logged loss matches what we're optimizing
-                        torch.distributed.all_reduce(running_loss)
+                        torch.distributed.all_reduce(running_metrics["loss"])
 
                         # Manually scale the gradients from unnormalized loss by total # of tokens
                         self._grad_scaler(
-                            self._model.parameters(),
-                            self.world_size / metrics["current_num_tokens"],
+                            list(self._model.parameters()),
+                            self.world_size / running_metrics["current_num_tokens"],
                             False if self.parallel_dims.tp_enabled else None,
                         )
 
@@ -1060,10 +1059,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     ):
                         precompute_float8_dynamic_scale_for_fsdp(self._model)
 
-                    total_metrics = self.calculate_total_metrics(
-                        running_metrics,
-                        loss_factor=None if not self.optimizer_in_bwd else 1.0,
-                    )
+                    total_metrics = self.calculate_total_metrics(running_metrics)
                     pbar.update(1)
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {total_metrics['loss']}"
@@ -1089,7 +1085,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 ),
                             ),
                             "tokens_per_second_per_gpu": (
-                                num_tokens / self.parallel_dims.non_data_parallel_size
+                                total_metrics["current_num_tokens"] / self.parallel_dims.non_data_parallel_size
                             )
                             / (time_per_step * self.world_size),
                         }
@@ -1105,8 +1101,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         )
 
                     # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
+                    running_metrics = {}
                     t0 = time.perf_counter()
 
                     # Stop tracking CUDA memory now that active steps are complete
@@ -1188,7 +1183,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 torch.abs(max(losses) - min(losses)) for losses in per_group_loss
             )
             / len(per_group_loss),
-            "variance": sum(torch.var(losses) for losses in per_group_loss)
+            "variance": sum(torch.var(losses, unbiased=False) for losses in per_group_loss)
             / len(per_group_loss),
             "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
             "mean": total_mean_loss,
@@ -1231,12 +1226,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         prompts = batch["prompt"]
         labels = batch["generation_label"]
 
+        attention_mask = prompts.ne(self._tokenizer.pad_id).long()
+
         predictions = self.generator.generate(
             prompts=prompts,
+            attention_mask=attention_mask,
             max_len=labels.shape[1],
         )
-        # predictions = predictions[:, prompts.shape[-1] :]
-        self.per_prompt_acc(predictions[:, prompts.shape[-1] :], labels, templates)
+        predictions = predictions[:, prompts.shape[-1] :]
         # Decode labels and predictions
         pred_text = [
             self._tokenizer.decode(prediction, truncate_at_eos=True)
@@ -1254,6 +1251,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         squad_pred = [
             {"id": str(i), "prediction_text": text} for i, text in enumerate(pred_text)
         ]
+        self.per_prompt_acc(predictions, labels, templates)
         self.squad.update(
             preds=squad_pred,
             target=squad_label,
@@ -1291,6 +1289,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 )
 
     def per_prompt_acc(self, predictions, labels, templates):
+        # Replace label padding with -100
+        labels[labels == self._tokenizer.pad_id] = -100
         per_sample_acc = predictions.eq(labels).float().sum(dim=1) / labels.ne(
             -100
         ).float().sum(dim=1)
