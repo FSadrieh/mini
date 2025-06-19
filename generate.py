@@ -25,20 +25,24 @@ class InferenceRecipe:
 
     def __init__(self, cfg: DictConfig, device, dtype, seed) -> None:
         self.cfg = cfg
+        self.checkpoint_dir = None
         self._device = device
         self._dtype = dtype
-        set_seed(seed)
+        self._seed = seed
 
     def setup(self, checkpoint_dir, pad_token) -> bool:
         # We do not evaluate a epoch twice
-        if self.cfg.checkpointer.checkpoint_dir == checkpoint_dir and "epoch" in checkpoint_dir:
+        if self.checkpoint_dir == checkpoint_dir:
             logger.info(
                 "Checkpoint directory is already set in the config, skipping generate."
             )
             return False
-        self.cfg.checkpointer.checkpoint_dir = checkpoint_dir
-        self.model = AutoModelForCausalLM.from_pretrained(self.cfg.checkpointer.checkpoint_dir)
-        self.model = self.model.to(self._device, dtype=self._dtype)
+
+        set_seed(self._seed)
+        self.checkpoint_dir = checkpoint_dir
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.checkpoint_dir, torch_dtype=self._dtype
+        ).to(self._device)
         self.model.config.pad_token_id = pad_token
         self.pad_token = pad_token
         self.model.eval()
