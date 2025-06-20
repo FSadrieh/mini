@@ -18,12 +18,12 @@
 # best to use 1B_full_single_device.yaml for those cases
 
 
-output_dir: /data/shared/ld/mini/torchtune/llama3_2_1B/full # /tmp may be deleted by your system. Change it to your preference.
+output_dir: /data/shared/ld/mini/torchtune/llama3_2_1B_instruct/full # /tmp may be deleted by your system. Change it to your preference.
 
 # Tokenizer
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
-  path: /data/shared/ld/mini/Llama-3.2-1B/original/tokenizer.model
+  path: /data/shared/ld/mini/Llama-3.2-1B-Instruct/original/tokenizer.model
   max_seq_len: null
 
 # Dataset and Sampler
@@ -45,7 +45,7 @@ model:
 
 checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
-  checkpoint_dir: /data/shared/ld/mini/Llama-3.2-1B/
+  checkpoint_dir: /data/shared/ld/mini/Llama-3.2-1B-Instruct/
   checkpoint_files: [
     model.safetensors
   ]
@@ -62,7 +62,7 @@ loss:
   _component_: torchtune.modules.loss.LinearCrossEntropyLoss
 
 # Training
-epochs: 10
+epochs: 0 #ONLY EVAL
 max_steps_per_epoch: null
 gradient_accumulation_steps: 4  # Use to increase effective batch size
 
@@ -79,13 +79,13 @@ optimizer_in_bwd: False  # True saves memory. Requires gradient_accumulation_ste
 
 
 # Logging
-# metric_logger: #TODO: Enable Disk logging
-#   _component_: torchtune.training.metric_logging.DiskLogger
-#   log_dir: ${output_dir}/logs
-metric_logger: #TODO: Enable WandB logging
-  _component_: torchtune.training.metric_logging.WandBLogger
-  project: mini
-  entity: transformersclub
+metric_logger: #TODO: Enable Disk logging
+  _component_: torchtune.training.metric_logging.DiskLogger
+  log_dir: ${output_dir}/logs
+# metric_logger: #TODO: Enable WandB logging
+#   _component_: torchtune.training.metric_logging.WandBLogger
+#   project: mini
+#   entity: transformersclub
 log_every_n_steps: 1
 log_peak_memory_stats: True
 log_level: INFO  # DEBUG, WARN, etc.

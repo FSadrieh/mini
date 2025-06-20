@@ -287,9 +287,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         ### My code ###
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
         self._eval_batches = cfg.get("eval_batches", 0)
-        self.sample_table = wandb.Table(
-            columns=["timestep", "prompt", "pred", "label", "em", "f1"]
-        )
         self.acc = None
         self.squad = SQuAD(
             dist_sync_on_step=True,
@@ -886,9 +883,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 enumerate(self._val_dataloader),
                 disable=not self._is_rank_zero,
                 desc="Validating",
-                total=self._eval_batches,
+                total=self._eval_batches if self._eval_batches > 0 else None,
             ):
-                if batch_idx >= self._eval_batches:
+                if batch_idx >= self._eval_batches and self._eval_batches > 0:
                     break
 
                 templates = batch.pop("templates", None)
@@ -921,8 +918,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Aggregate validation metrics across all ranks
         metrics = self.calculate_total_metrics(running_metrics)
         squad_metrics = self.squad.compute()
+        # Validation metrics
         log_dict = {
-            "val/ac curacy": self.acc.compute().item(),
+            "val/accuracy": self.acc.compute().item(),
             "val/loss": metrics["loss"],
             "val/mean_loss": metrics["mean"],
             "val/sum_loss": metrics["sum"],
@@ -931,12 +929,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "val/ppl": self.ppl.compute().item(),
         }
 
+        # Generation metrics
         log_dict.update(
             {
                 "val/exact_match": squad_metrics["exact_match"].item(),
                 "val/f1": squad_metrics["f1"].item(),
                 "val/bleu": self.bleu.compute().item(),
-                **{f"val/{k}": float(v) for k, v in self.rouge.compute().items()},
+                "val/rougeL": self.rouge.compute()["rougeL_fmeasure"].item(),
             }
         )
 
@@ -1159,10 +1158,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
     def cleanup(self) -> None:
         if self._is_rank_zero:
-            self._metric_logger.log_dict(
-                {"sample_table": self.sample_table}, step=self.global_step
-            )
-            self._logger.info("Training completed. Logged sample table...")
+            self._logger.info("Training completed.")
             self._metric_logger.close()
         destroy_process_group()
 
@@ -1289,9 +1285,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 prompts,
                 pred_text,
                 label_text,
-                batch["sample_count"],
                 squad_pred,
                 squad_label,
+                templates,
             )
 
     def get_em_per_prompt(
@@ -1311,9 +1307,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         prompts: torch.Tensor,
         pred_text: list[str],
         label_text: list[str],
-        sample_count: torch.Tensor,
         squad_pred: list[str],
         squad_label: list[str],
+        templates: list[str],
     ):
         prompts = [
             self._tokenizer.decode(prompt, truncate_at_eos=True)
@@ -1322,18 +1318,34 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._logger.info(
             f"Generated example:\nPrompt:\n{prompts[0]}\nPred:{pred_text[0]}\nLabel:{label_text[0]}"
         )
-        for i in range(sample_count[0].item()):
+        ems, f1s = [], []
+        for i in range(len(prompts)):
             self.individual_squad.reset()
             self.individual_squad.update(preds=[squad_pred[i]], target=[squad_label[i]])
             individual_metrics = self.individual_squad.compute()
-            self.sample_table.add_data(
-                self.global_step,
-                prompts[i],
-                pred_text[i],
-                label_text[i],
-                individual_metrics["exact_match"],
-                individual_metrics["f1"],
-            )
+            ems.append(individual_metrics["exact_match"].item())
+            f1s.append(individual_metrics["f1"].item())
+
+        timestep = [self.global_step] * len(pred_text)
+        sample_table = wandb.Table(
+            columns=["timestep", "template", "prompt", "pred", "label", "em", "f1"],
+            data=list(
+                zip(
+                    timestep,
+                    templates,
+                    prompts,
+                    pred_text,
+                    label_text,
+                    ems,
+                    f1s,
+                )
+            ),
+        )
+        if self._is_rank_zero:
+            self._metric_logger.log_dict(
+                    {"sample_table": sample_table},
+                    step=self.global_step,
+                )
 
 
 def get_rank() -> int:
