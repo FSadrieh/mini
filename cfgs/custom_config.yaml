@@ -30,7 +30,7 @@ tokenizer:
 dataset:
   firstn_datasets: 0
   data_location: correct_full_data
-  preprocessing_workers: 10
+  preprocessing_workers: 1
 seed: 42
 batch_size: 16
 
@@ -65,6 +65,7 @@ loss:
 epochs: 10
 max_steps_per_epoch: null
 gradient_accumulation_steps: 4  # Use to increase effective batch size
+batched_generation: True  # Use to generate multiple samples in a single forward pass
 
 # Environment
 device: cuda

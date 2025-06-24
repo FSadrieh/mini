@@ -362,7 +362,6 @@ class PromptLoader:
                 )
                 # We first try to load the dataset from disk if we have tokenized it before
                 try:
-                    raise OSError  # Force to load from hub
                     # logger.info(f"Processing {dataset_id}...")
                     dataset = Dataset.load_from_disk(dataset_path)
                     # logger.info(f"Loaded {dataset_id} dataset from disk.")
@@ -436,7 +435,6 @@ class PromptLoader:
         # We merge all datasets, shuffle them and save them to disk
         full_dataset = datasets.concatenate_datasets(dataset_list)
         del dataset_list
-        if split == "train":
-            full_dataset = full_dataset.shuffle(seed=self.seed)
+        full_dataset = full_dataset.shuffle(seed=self.seed)
         full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))
         return full_dataset
