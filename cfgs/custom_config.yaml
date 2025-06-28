@@ -29,15 +29,16 @@ tokenizer:
 # Dataset and Sampler
 dataset:
   firstn_datasets: 0
-  data_location: correct_full_data
+  data_location: data_batches
   preprocessing_workers: 1
+  data_mode: data_batches  # Options: default, data_batches
 seed: 42
 batch_size: 16
 
 # Validation
 run_val_every_n_steps: 2048  # Change to an integer to enable validation every N steps
 eval_batches: 0
-batch_size_val: 128
+batch_size_val: 64
 
 # Model Arguments
 model:
@@ -65,6 +66,7 @@ loss:
 epochs: 10
 max_steps_per_epoch: null
 gradient_accumulation_steps: 4  # Use to increase effective batch size
+loss_type: variance
 
 # Environment
 device: cuda
