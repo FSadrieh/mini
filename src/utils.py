@@ -1,4 +1,15 @@
 import torch
+import debugpy
+
+
+def wait_for_debugger(is_rank_zero: bool):
+    port = 56789
+    if is_rank_zero:
+        debugpy.listen(("0.0.0.0", port))
+        print(
+            f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
+        )
+        debugpy.wait_for_client()
 
 
 def calculate_loss(custom_loss, logits, labels, sample_count):
@@ -56,7 +67,6 @@ def make_sanity_check(
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
     predictions: torch.Tensor,
-    position_ids: torch.Tensor,
     generator,
     tokenizer,
 ):
@@ -64,54 +74,42 @@ def make_sanity_check(
         if not (pred_1 == pred_2).all():
             for i, pred in enumerate(pred_1):
                 if not (pred == pred_2[i]).all():
-                    return True, f"{msg} at index {i}: {pred_1[i]} != {pred_2[i]}"
-        return False, ""
+                    raise ValueError(f"{msg} at index {i}: {pred_1[i]} != {pred_2[i]}")
 
     # We generate the predictions again to ensure determinism
     predictions_again = generator.generate(
         prompts=prompts,
         attention_mask=attention_mask,
         max_new_tokens=labels.shape[1],
-        position_ids=position_ids,
     )
 
-    error, msg = _assertion(
+    _assertion(
         predictions,
         predictions_again,
         "Predictions with position_ids differ from the original",
     )
-    if error:
-        return error, msg
-
     # Check if position_ids make a difference
     predictions_no_pids = generator.generate(
         prompts=prompts,
         attention_mask=attention_mask,
         max_new_tokens=labels.shape[1],
-        position_ids=None,  # No position_ids
     )
     _assertion(
         predictions,
         predictions_no_pids,
         "Predictions with position_ids differ from the original without position_ids",
     )
-    if error:
-        return error, msg
 
     # We generate unbatched predictions to enusre our batching does not change anything
     individual_predictions = []
-    for prompt in prompts:
-        prompt = prompt[prompt.ne(tokenizer.pad_id)].unsqueeze(0)
-        attention_mask = torch.ones_like(prompt, dtype=torch.long)
+    for i, prompt in enumerate(prompts):
         individual_predictions.append(
             generator.generate(
-                prompts=prompt,
-                attention_mask=attention_mask,
+                prompts=prompt.unsqueeze(0),
+                attention_mask=attention_mask[i].unsqueeze(0),
                 max_new_tokens=labels.shape[1],
-                position_ids=None,
             )
         )
-
     # Make one tensor through stacking and padding
     padded = torch.stack(
         [
@@ -121,14 +119,39 @@ def make_sanity_check(
             for t in individual_predictions
         ]
     ).squeeze(1)
+
+    individual_predictions = []
+    for prompt in prompts:
+        prompt = prompt[prompt.ne(tokenizer.pad_id)].unsqueeze(0)
+        attention_mask = torch.ones_like(prompt, dtype=torch.long)
+        individual_predictions.append(
+            generator.generate(
+                prompts=prompt,
+                attention_mask=attention_mask,
+                max_new_tokens=labels.shape[1],
+            )
+        )
+
+    # Make one tensor through stacking and padding
+    non_padded = torch.stack(
+        [
+            torch.nn.functional.pad(
+                t, (0, labels.shape[1] - t.shape[1]), value=tokenizer.eos_id
+            )
+            for t in individual_predictions
+        ]
+    ).squeeze(1)
+
+    _assertion(
+        padded,
+        non_padded,
+        "Unbatched prediction with padding ",
+    )
     _assertion(
         predictions,
-        padded,
-        "Predictions with position_ids differ from the unbatched generation",
+        non_padded,
+        "Batched predictions differ from the unbatched predcitions without padding",
     )
-    if error:
-        return error, msg
-    return False, "Sanity check passed, all predictions match expected results."
 
 
 def get_em_per_prompt(

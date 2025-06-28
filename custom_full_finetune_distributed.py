@@ -7,7 +7,6 @@
 import os
 import sys
 import time
-import debugpy
 
 from functools import partial
 from typing import Any, Optional, Union
@@ -58,6 +57,7 @@ from src.utils import (
     log_metrics_over_epoch,
     make_sanity_check,
     get_em_per_prompt,
+    wait_for_debugger,
 )
 
 
@@ -195,7 +195,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         else:
             self.dp_degree, self.dp_rank = 1, 0
 
-        # Add timestamp to checkpoint
+        # OWN CODE: Add timestamp to checkpoint
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             cfg.checkpointer.output_dir = cfg.checkpointer.output_dir + f"_{timestamp}"
@@ -290,7 +290,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
         self.global_step = 0
 
-        ### My code ###
+        ### OWN CODE ###
+        if cfg.debug:
+            wait_for_debugger(self._is_rank_zero)
+
+        if cfg.offline:
+            self._metric_logger = {
+                "_component_": "torchtune.training.metric_logging.DiskLogger",
+                "log_dir": f"{self._output_dir}/logs",
+            }
+        else:
+            self._metric_logger = cfg.metric_logger
+
         self._run_val_every_n_steps = cfg.get("run_val_every_n_steps", None)
         self._eval_batches = cfg.get("eval_batches", 0)
         self.acc = None
@@ -319,7 +330,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         self.current_checkpoint_dir = cfg.checkpointer.checkpoint_dir
 
-        self.batched_generation = cfg.batched_generation
+        self.sanity_check = cfg.sanity_check
 
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
         """
@@ -372,7 +383,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             training.set_torch_num_threads()
 
         if self._is_rank_zero:
-            self._metric_logger = config.instantiate(cfg.metric_logger)
+            self._metric_logger = config.instantiate(self._metric_logger)
             # log config with parameter override
             self._metric_logger.log_config(cfg)
 
@@ -477,6 +488,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
 
+        ### OWN CODE ####
         self._tokenizer.pad_id = self._tokenizer.eos_id
         tokenizer_name = cfg.tokenizer._component_.split(".")[-1]
         data_config = {
@@ -526,6 +538,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False`
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
 
+        ### OWN CODE ###
         self.acc = Accuracy(
             task="multiclass",
             num_classes=self._model.tok_embeddings.weight.shape[0],
@@ -1185,47 +1198,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         labels = batch["generation_label"]
         attention_mask = prompts.ne(self._tokenizer.pad_id).long()
 
-        # position_ids = torch.zeros_like(prompts, dtype=torch.long)
-
-        # for i in range(prompts.shape[0]):
-        #     # find the first real token (mask==1)
-        #     first_token_idx = attention_mask[i].nonzero(as_tuple=True)[0][0]
-        #     real_len = prompts.shape[1] - first_token_idx
-        #     position_ids[i, first_token_idx:] = torch.arange(
-        #         real_len, device=prompts.device
-        #     )
-
-        if self.batched_generation:
-            predictions = self.generator.generate(
-                prompts=prompts,
-                attention_mask=attention_mask,
-                max_new_tokens=labels.shape[1],
-                # position_ids=position_ids,
-            )
-        else:
-            individual_predictions = []
-            for prompt in prompts:
-                prompt = prompt[prompt.ne(self._tokenizer.pad_id)].unsqueeze(0)
-                attention_mask = torch.ones_like(prompt, dtype=torch.long)
-                individual_predictions.append(
-                    self.generator.generate(
-                        prompts=prompt,
-                        attention_mask=attention_mask,
-                        max_new_tokens=labels.shape[1],
-                    )
-                )
-
-            # Make one tensor through stacking and padding
-            predictions = torch.stack(
-                [
-                    torch.nn.functional.pad(
-                        t,
-                        (0, labels.shape[1] - t.shape[1]),
-                        value=self._tokenizer.eos_id,
-                    )
-                    for t in individual_predictions
-                ]
-            ).squeeze(1)
+        predictions = self.generator.generate(
+            prompts=prompts,
+            attention_mask=attention_mask,
+            max_new_tokens=labels.shape[1],
+        )
 
         # Decode labels and predictions
         pred_text = [
@@ -1259,19 +1236,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.rouge.update(preds=pred_text, target=label_text)
 
         if batch_idx == 0:
-            # error, msg = make_sanity_check(
-            #     prompts,
-            #     attention_mask,
-            #     labels,
-            #     predictions,
-            #     position_ids,
-            #     self.generator,
-            #     self._tokenizer,
-            # )
-            # if error:
-            #     raise ValueError(
-            #         f"Sanity check failed for batch {batch_idx} with error: {msg}"
-            #     )
+            # Takes some time so should be used sparingly
+            if self.sanity_check:
+                make_sanity_check(
+                    prompts,
+                    attention_mask,
+                    labels,
+                    predictions,
+                    self.generator,
+                    self._tokenizer,
+                )
 
             # We want to include special tokens in the predictions
             reversed_special_tokens = {
@@ -1357,7 +1331,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "template",
                 "prompt",
                 "pred",
-                "pred_with_special_tokens",
+                "pred_with_st",
                 "label",
                 "em",
                 "f1",
@@ -1413,12 +1387,4 @@ def recipe_main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    current_process_rank = get_rank()
-    # port = 56789
-    # if current_process_rank == 0:
-    #     debugpy.listen(("0.0.0.0", port))
-    #     print(
-    #         f"Waiting for client to attach on port {port}... NOTE: if using docker, you need to forward the port with -p {port}:{port}."
-    #     )
-    #     debugpy.wait_for_client()
     sys.exit(recipe_main())

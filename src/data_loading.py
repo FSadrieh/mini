@@ -377,8 +377,8 @@ class PromptLoader:
                     # For each sample in the dataset we apply the templates
 
                     # Only take 10.000 random examples per dataset
-                    if split == "train" and len(dataset) > 1_000:
-                        dataset = dataset.shuffle(seed=self.seed).select(range(1_000))
+                    # if split == "train" and len(dataset) > 1_000:
+                    #     dataset = dataset.shuffle(seed=self.seed).select(range(1_000))
                     for sample in tqdm(dataset, desc=f"Processing {dataset_id}"):
                         example_tokens, example_prompt, template_ids = [], [], []
                         for template_id, template in templates.templates.items():
