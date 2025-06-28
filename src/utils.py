@@ -12,7 +12,7 @@ def wait_for_debugger(is_rank_zero: bool):
         debugpy.wait_for_client()
 
 
-def calculate_loss(custom_loss, logits, labels, sample_count):
+def calculate_custom_losses(custom_loss, logits, labels, sample_count):
     per_token_loss = custom_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
     total_mean_loss = per_token_loss.sum() / labels.ne(-100).sum().float()
     per_token_loss = per_token_loss.view(labels.size(0), labels.size(1))
@@ -28,6 +28,22 @@ def calculate_loss(custom_loss, logits, labels, sample_count):
         "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
         "mean": total_mean_loss,
     }
+
+
+def get_calculate_loss(loss_type: str):
+    def normal_loss(metrics):
+        return metrics["loss"]
+
+    def variance_loss(metrics):
+        return metrics["loss"] + metrics["variance"]
+
+    if loss_type == "default":
+        return normal_loss
+    if loss_type == "variance":
+        return variance_loss
+    raise ValueError(
+        f"Unknown loss type: {loss_type}. Supported types are 'default' and 'variance'."
+    )
 
 
 def log_metrics_over_epoch(

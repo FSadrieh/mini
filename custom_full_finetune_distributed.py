@@ -53,11 +53,12 @@ from src.data_loading import CustomDataLoader
 from src.generate import InferenceRecipe
 from src.utils import (
     calculate_total_metrics,
-    calculate_loss,
+    calculate_custom_losses,
     log_metrics_over_epoch,
     make_sanity_check,
     get_em_per_prompt,
     wait_for_debugger,
+    get_calculate_loss,
 )
 
 
@@ -332,6 +333,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self.sanity_check = cfg.sanity_check
 
+        # The calculate loss allows us to combine different loss functions
+        self._calculate_loss = get_calculate_loss(cfg.loss_type)
+
     def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
         """
         Updates the recipe state from checkpoint.
@@ -494,6 +498,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         data_config = {
             "tokenizer": self._tokenizer,
             "tokenizer_name": tokenizer_name,
+            "data_mode": cfg.dataset.get("data_mode", "default"),
             "batch_size": cfg.batch_size,
             "firstn_datasets": cfg.dataset.get("firstn_datasets", None),
             "seed": cfg.get("seed", self.seed),
@@ -879,7 +884,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Compute accuracy and custom losses
         logits = self._model.output(outputs)
-        metrics = calculate_loss(
+        metrics = calculate_custom_losses(
             self.custom_loss, logits, labels, batch["sample_count"].tolist()
         )
         metrics["loss"] = loss
@@ -1036,7 +1041,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     metrics["current_num_tokens"] = (
                         batch["labels"] != self._loss_fn.ignore_index
                     ).sum()
-                    current_loss = metrics["loss"] * metrics["current_num_tokens"]
+                    current_loss = (
+                        self._calculate_loss(metrics) * metrics["current_num_tokens"]
+                    )
 
                     running_metrics = log_metrics_over_epoch(
                         metrics,
