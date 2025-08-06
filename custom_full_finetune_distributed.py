@@ -54,6 +54,7 @@ from src.generate import InferenceRecipe
 from src.utils import (
     calculate_total_metrics,
     calculate_custom_losses,
+    calculate_custom_data_batch_losses,
     log_metrics_over_epoch,
     make_sanity_check,
     get_em_per_prompt,
@@ -332,6 +333,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.current_checkpoint_dir = cfg.checkpointer.checkpoint_dir
 
         self.sanity_check = cfg.sanity_check
+        self.is_data_batches = cfg.dataset.data_mode == "data_batches"
+        self.inner_validate = self.get_inner_validate()
 
         # The calculate loss allows us to combine different loss functions
         self._calculate_loss = get_calculate_loss(cfg.loss_type)
@@ -882,15 +885,96 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # Compute loss
         loss = self._loss_fn(outputs, labels)
 
-        # Compute accuracy and custom losses
         logits = self._model.output(outputs)
-        metrics = calculate_custom_losses(
-            self.custom_loss, logits, labels, batch["sample_count"].tolist()
-        )
-        metrics["loss"] = loss
 
         del outputs
-        return metrics, logits
+        return loss, logits
+
+    def get_inner_validate(self) -> dict[str, float]:
+        def _inner_default(
+            batch_idx: int,
+            batch: dict[str, torch.Tensor],
+            running_metrics: dict[str, torch.Tensor],
+        ) -> dict[str, torch.Tensor]:
+            templates = batch.pop("templates", None)
+            utils.batch_to_device(batch, self._device)
+
+            # Compute loss
+            loss, logits = self._loss_step(batch)
+
+            metrics = calculate_custom_losses(
+                self.custom_loss,
+                logits,
+                batch["labels"],
+                batch["sample_count"].tolist(),
+            )
+            metrics["loss"] = loss
+
+            # Count tokens excluding padding
+            metrics["current_num_tokens"] = (
+                batch["labels"] != self._loss_fn.ignore_index
+            ).sum()
+
+            self.ppl.update(
+                logits,
+                batch["labels"],
+            )
+            predictions = torch.argmax(logits, axis=-1).view(-1)
+            mask = batch["labels"].view(-1).ne(-100)
+            self.acc.update(
+                preds=predictions[mask],
+                target=batch["labels"].view(-1)[mask],
+            )
+
+            self.generate(batch, templates, batch_idx)
+
+            return log_metrics_over_epoch(
+                metrics, running_metrics, self._device
+            )
+
+        def _inner_data_batches(
+            dataset_batch_idx: int,
+            dataset_batch: dict[str, torch.Tensor],
+            running_metrics: dict[str, torch.Tensor],
+        ) -> dict[str, torch.Tensor]:
+            template_metrics = []
+
+            for template_batch_idx, template_batch in enumerate(dataset_batch):
+                templates = template_batch.pop("templates", None)
+                utils.batch_to_device(template_batch, self._device)
+
+                # Compute loss
+                loss, logits = self._loss_step(template_batch)
+
+                metrics = {"loss": loss}
+
+                # Count tokens excluding padding
+                metrics["current_num_tokens"] = (
+                    template_batch["labels"] != self._loss_fn.ignore_index
+                ).sum()
+
+                template_metrics.append(metrics)
+
+                self.ppl.update(
+                    logits,
+                    template_batch["labels"],
+                )
+                predictions = torch.argmax(logits, axis=-1).view(-1)
+                mask = template_batch["labels"].view(-1).ne(-100)
+                self.acc.update(
+                    preds=predictions[mask],
+                    target=template_batch["labels"].view(-1)[mask],
+                )
+
+                # TODO:
+                self.generate(template_batch, templates, template_batch_idx)
+
+            dataset_metrics = calculate_custom_data_batch_losses(template_metrics)
+            return log_metrics_over_epoch(
+                dataset_metrics, running_metrics, self._device
+            )
+
+        return _inner_data_batches if self.is_data_batches else _inner_default()
 
     def validate(self) -> dict[str, float]:
         """
@@ -902,7 +986,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         running_metrics = {}
         self.em_per_prompt = {}
 
-        self.generator.setup(
+        self.generator.setup(  # TODO: SEE ERROR_AVR.TXT
             self.current_checkpoint_dir,
             self._tokenizer.pad_id,
             [self._tokenizer.eos_id, self._tokenizer.special_tokens["<|eot_id|>"]],
@@ -918,34 +1002,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if batch_idx >= self._eval_batches and self._eval_batches > 0:
                     break
 
-                templates = batch.pop("templates", None)
-                utils.batch_to_device(batch, self._device)
-
-                # Compute loss
-
-                metrics, logits = self._loss_step(batch)
-
-                # Count tokens excluding padding
-                metrics["current_num_tokens"] = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
-
-                self.ppl.update(
-                    logits,
-                    batch["labels"],
-                )
-                predictions = torch.argmax(logits, axis=-1).view(-1)
-                mask = batch["labels"].view(-1).ne(-100)
-                self.acc.update(
-                    preds=predictions[mask],
-                    target=batch["labels"].view(-1)[mask],
-                )
-
-                running_metrics = log_metrics_over_epoch(
-                    metrics, running_metrics, self._device
-                )
-
-                self.generate(batch, templates, batch_idx)
+                running_metrics = self.inner_validate(batch_idx, batch, running_metrics)
 
         # Aggregate validation metrics across all ranks
         metrics = calculate_total_metrics(running_metrics)
@@ -1034,7 +1091,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 with self.context_parallel_manager(list(batch.values())):
-                    metrics, __ = self._loss_step(batch)
+                    loss, logits = self._loss_step(batch)
+
+                    metrics = calculate_custom_losses(
+                        self.custom_loss,
+                        logits,
+                        batch["labels"],
+                        batch["sample_count"].tolist(),
+                    )
+                    metrics["loss"] = loss
 
                     # Calculate the number of unmasked tokens in the current batch
                     # and increment the total number of tokens seen in the step
@@ -1242,7 +1307,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self.bleu.update(preds=[pred], target=[[label_text[i]]])
         self.rouge.update(preds=pred_text, target=label_text)
 
-        if batch_idx == 0:
+        if (
+            batch_idx == 0 and not self.is_data_batches
+        ):  # TODO: Currently only supported with data_mode default
             # Takes some time so should be used sparingly
             if self.sanity_check:
                 make_sanity_check(
@@ -1261,9 +1328,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             pred_text_with_st = [
                 "".join(
                     [
-                        self._tokenizer.decode([p])
-                        if self._tokenizer.decode([p]) != ""
-                        else reversed_special_tokens[p]
+                        (
+                            self._tokenizer.decode([p])
+                            if self._tokenizer.decode([p]) != ""
+                            else reversed_special_tokens[p]
+                        )
                         for p in prediction
                     ]
                 )

@@ -12,7 +12,18 @@ def wait_for_debugger(is_rank_zero: bool):
         debugpy.wait_for_client()
 
 
-def calculate_custom_losses(custom_loss, logits, labels, sample_count):
+# Custom loss calculation:
+# The distance loss is the absolute difference between the maximum and minimum loss for a sample, so the template with the lowest and highest loss
+# The variance loss is the variance of the losses for a sample, so how much the losses differ within a sample
+# The sum loss is the sum of the losses for a sample, so how much the losses add up
+# The mean loss is the mean of the losses for a sample
+# We should see a correlation between the distance and variance loss, as a higher distance should lead to a higher variance
+# Also the sum and mean loss should be correlated, as a higher sum should lead to a higher mean
+
+
+def calculate_custom_losses(
+    custom_loss, logits, labels, sample_count
+) -> dict[str, torch.Tensor]:
     per_token_loss = custom_loss(logits.view(-1, logits.size(-1)), labels.view(-1))
     total_mean_loss = per_token_loss.sum() / labels.ne(-100).sum().float()
     per_token_loss = per_token_loss.view(labels.size(0), labels.size(1))
@@ -27,6 +38,21 @@ def calculate_custom_losses(custom_loss, logits, labels, sample_count):
         / len(per_group_loss),
         "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
         "mean": total_mean_loss,
+    }
+
+
+def calculate_custom_data_batch_losses(
+    metrics: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    losses = torch.stack([metric["loss"] for metric in metrics])
+    current_num_tokens = sum(metric["current_num_tokens"] for metric in metrics)
+    return {
+        "distance": torch.abs(torch.max(losses) - torch.min(losses)),
+        "variance": torch.var(losses, unbiased=False),
+        "sum": losses.sum(),
+        "loss": losses.mean(),
+        "mean": losses.mean(),
+        "current_num_tokens": current_num_tokens,
     }
 
 

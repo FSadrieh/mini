@@ -149,16 +149,25 @@ class CustomDataLoader:
         return dataset
 
     def get_collator(self):
-        # TODO: Seperate collator for data_batch
-        def collate(examples):
-            if "templates" in examples[0]["batches"]:
-                templates = examples[0]["batches"].pop("templates")
-                batch = {k: torch.tensor(v) for k, v in examples[0]["batches"].items()}
-                batch["templates"] = templates
-                return batch
-            return {k: torch.tensor(v) for k, v in examples[0]["batches"].items()}
 
-        return collate
+        def _collate(batch: dict[str, list[list[int|str]]]) -> dict[str, torch.Tensor]:
+            if "templates" in batch:
+                templates = batch.pop("templates")
+                collated_batch = {k: torch.tensor(v) for k, v in batch.items()}
+                collated_batch["templates"] = templates
+                return collated_batch
+            return {k: torch.tensor(v) for k, v in batch.items()}
+
+        def collate_default(examples: tuple[dict[str, dict[str, list[list[int|str]]]]]) -> dict[str, torch.Tensor]:
+            return _collate(examples[0]["batches"])
+
+        def collate_with_data_batches(examples: tuple[dict[str, list[dict[str, list[list[int|str]]]]]]) -> list[dict[str, torch.Tensor]]:
+            collated_batch = []
+            for example in examples[0]['batches']:
+                collated_batch.append(_collate(example))
+            return collated_batch
+
+        return collate_default if self.data_mode == "default" else collate_with_data_batches
 
 
 def make_tokenize_function(tokenizer: PreTrainedTokenizerFast):
@@ -336,6 +345,7 @@ def make_preprocess_function(
         The data batch ensures 1 and 2. To ensure 3 we shuffle the data batches afterwards and need to set gradient accumulation steps to > 1.
         """
         data_batches = []
+        # We want a batch per template. So data_batch needs to be the same length as the number of templates
         data_batch = [
             {"batch_tokens": [], "batch_prompt": [], "batch_generation_label": []}
             for _ in examples["templates"][0]
@@ -359,10 +369,12 @@ def make_preprocess_function(
                             template_batch["batch_tokens"],
                             template_batch["batch_prompt"],
                             template_batch["batch_generation_label"],
-                            examples["templates"][start_of_batch_idx]
-                            * len(template_batch["batch_tokens"]),
+                            [template_name] * len(template_batch["batch_tokens"]),
                         )
-                        for template_batch in data_batch
+                        # We match each template_batch with its template_name
+                        for template_batch, template_name in zip(
+                            data_batch, examples["templates"][start_of_batch_idx]
+                        )
                     ]
                 )
                 # Reset the data batch for the next sample
@@ -380,7 +392,7 @@ def make_preprocess_function(
                 zip(sample_tokens, sample_prompt, sample_templates)
             ):
                 example_tokens, example_prompt, example_template = example
-                # We make sure each batch has only one dataset. Thus we throw away the first examples of the next dataset an dcreate a smaller batch
+                # We make sure each batch has only one dataset. Thus we throw away the first examples of the next dataset and create a smaller batch
                 if example_template not in examples["templates"][start_of_batch_idx]:
                     continue
                 data_batch[example_idx]["batch_tokens"].append(
@@ -497,7 +509,7 @@ class PromptLoader:
             and dataset_id in T0_HELDOUT_TASKS
             or split != "train"
             and dataset_id not in T0_HELDOUT_TASKS
-            or (dataset_id, subset) not in self.debug_tasks #TODO:
+            or (dataset_id, subset) not in self.debug_tasks  # TODO:
         ):
             return False, None
         # We first try to load the dataset from disk if we have tokenized it before
