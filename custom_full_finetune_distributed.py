@@ -60,6 +60,8 @@ from src.utils import (
     get_em_per_prompt,
     wait_for_debugger,
     get_calculate_loss,
+    get_gradient_aggregation,
+    get_gradients,
 )
 
 
@@ -335,6 +337,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.sanity_check = cfg.sanity_check
         self.is_data_batches = cfg.dataset.data_mode == "data_batches"
         self.inner_validate = self.get_inner_validate()
+        self.inner_train = self.get_inner_train()
+        self.aggregate = get_gradient_aggregation(cfg.gradient_aggregation_type)
 
         # The calculate loss allows us to combine different loss functions
         self._calculate_loss = get_calculate_loss(cfg.loss_type)
@@ -501,7 +505,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         data_config = {
             "tokenizer": self._tokenizer,
             "tokenizer_name": tokenizer_name,
-            "data_mode": cfg.dataset.datamode,
+            "data_mode": cfg.dataset["data_mode"],
             "batch_size": cfg.batch_size,
             "firstn_datasets": cfg.dataset.get("firstn_datasets", None),
             "seed": cfg.get("seed", self.seed),
@@ -883,21 +887,27 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 outputs = outputs.full_tensor()
 
         # Compute loss
-        loss = self._loss_fn(outputs, labels)
+        loss: torch.Tensor = self._loss_fn(outputs, labels)
 
-        logits = self._model.output(outputs)
+        logits: torch.Tensor = self._model.output(outputs)
 
         del outputs
         return loss, logits
 
     def get_inner_validate(self) -> dict[str, float]:
         """
-            Returns the handling for a single validation batch depending if they are:
-            - template_batches (all templates for one sample are in the batch)
-            - data_batches (a batch contains a batch for each template, these inner batches contain only one template for multiple examples)
+        Returns the handling for a single validation batch depending if they are:
+        - template_batches (all templates for one sample are in the batch)
+        - data_batches (a batch contains a batch for each template, these inner batches contain only one template for multiple examples)
         """
 
-        def _get_additional_metrics(metrics: dict[str, float], batch: dict[str, torch.Tensor], logits: torch.Tensor) -> dict[str, float]:
+        def _get_additional_metrics(
+            metrics: dict[str, float],
+            batch: dict[str, torch.Tensor],
+            batch_idx: int,
+            logits: torch.Tensor,
+            templates: list[str],
+        ) -> dict[str, float]:
             metrics["current_num_tokens"] = (
                 batch["labels"] != self._loss_fn.ignore_index
             ).sum()
@@ -917,7 +927,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
             return metrics
 
-        def _inner_template_batches(
+        def _inner_validate_template_batches(
             batch_idx: int,
             batch: dict[str, torch.Tensor],
             running_metrics: dict[str, torch.Tensor],
@@ -936,13 +946,13 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
             metrics["loss"] = loss
 
-            metrics = _get_additional_metrics(metrics, batch, logits)
-
-            return log_metrics_over_epoch(
-                metrics, running_metrics, self._device
+            metrics = _get_additional_metrics(
+                metrics, batch, batch_idx, logits, templates
             )
 
-        def _inner_data_batches(
+            return log_metrics_over_epoch(metrics, running_metrics, self._device)
+
+        def _inner_validate_data_batches(
             dataset_batch_idx: int,
             dataset_batch: dict[str, dict[str, torch.Tensor]],
             running_metrics: dict[str, torch.Tensor],
@@ -956,7 +966,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Compute loss
                 loss, logits = self._loss_step(template_batch)
                 metrics = {"loss": loss}
-                metrics = _get_additional_metrics(metrics, batch, logits)
+                metrics = _get_additional_metrics(
+                    metrics, template_batch, template_batch_idx, logits, templates
+                )
                 template_metrics.append(metrics)
 
             dataset_metrics = calculate_custom_data_batch_losses(template_metrics)
@@ -964,7 +976,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 dataset_metrics, running_metrics, self._device
             )
 
-        return _inner_data_batches if self.is_data_batches else _inner_template_batches
+        return (
+            _inner_validate_data_batches
+            if self.is_data_batches
+            else _inner_validate_template_batches
+        )
 
     def validate(self) -> dict[str, float]:
         """
@@ -1036,59 +1052,67 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self._model.train()
         return log_dict
 
-    def get_train_inner(self):
+    def get_inner_train(self):
         """
-            Returns the handling for a single training batch depending if they are:
-            - template_batches (all templates for one sample are in the batch)
-            - data_batches (a batch contains a batch for each template, these inner batches contain only one template for multiple examples)
+        Returns the handling for a single training batch depending if they are:
+        - template_batches (all templates for one sample are in the batch)
+        - data_batches (a batch contains a batch for each template, these inner batches contain only one template for multiple examples)
         """
 
-        def _optimizer_backward(running_metrics, metrics, current_loss) -> None:
+        def _optimizer_backward(
+            running_metrics: dict[str, torch.Tensor],
+            metrics: dict[str, torch.Tensor],
+            current_loss: torch.Tensor,
+            batch: dict[str, torch.Tensor],
+        ) -> dict[str, torch.Tensor]:
             # For optimizer in backward, we need to normalize before calling backward
             # This case and gradient accumulation are mutually exclusive
-            if self._optimizer_in_bwd:
-                torch.distributed.all_reduce(
-                    running_metrics["current_num_tokens"]
+            with self.context_parallel_manager(list(batch.values())):
+                running_metrics = log_metrics_over_epoch(
+                    metrics,
+                    running_metrics,
+                    self._device,
                 )
-                torch.distributed.all_reduce(running_metrics["loss"])
-                current_loss = current_loss * (
-                    self.dp_degree / metrics["current_num_tokens"]
-                )
-            current_loss.backward()
-
-        def _optimizer_step(idx, running_metrics) -> None:
-            # Optimizer step (if not fused in backward call)
-            if (idx + 1) % self._gradient_accumulation_steps == 0:
-                if not self._optimizer_in_bwd:
-                    # Get total number of tokens across all ranks to normalize gradients
-                    torch.distributed.all_reduce(
-                        running_metrics["current_num_tokens"]
-                    )
-                    # This will ensure that the logged loss matches what we're optimizing
+                if self._optimizer_in_bwd:
+                    torch.distributed.all_reduce(running_metrics["current_num_tokens"])
                     torch.distributed.all_reduce(running_metrics["loss"])
-
-                    # Manually scale the gradients from unnormalized loss by total # of tokens
-                    self._grad_scaler(
-                        list(self._model.parameters()),
-                        self.world_size / running_metrics["current_num_tokens"],
-                        False if self.parallel_dims.tp_enabled else None,
+                    current_loss = current_loss * (
+                        self.dp_degree / metrics["current_num_tokens"]
                     )
+                current_loss.backward()
+            return running_metrics
 
-                    if self._clip_grad_norm is not None:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self._model.parameters(),
-                            max_norm=float(self._clip_grad_norm),
-                        )
-                        # If sharded, collect the DTensor here
-                        if isinstance(grad_norm, DTensor):
-                            grad_norm = grad_norm.full_tensor()
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
+        def _optimizer_step(running_metrics: dict[str, torch.Tensor]) -> None:
+            # Optimizer step (if not fused in backward call)
+            if not self._optimizer_in_bwd:
+                # Get total number of tokens across all ranks to normalize gradients
+                torch.distributed.all_reduce(running_metrics["current_num_tokens"])
+                # This will ensure that the logged loss matches what we're optimizing
+                torch.distributed.all_reduce(running_metrics["loss"])
 
-        def _inner_template_batches(
+                # Manually scale the gradients from unnormalized loss by total # of tokens
+                self._grad_scaler(
+                    list(self._model.parameters()),
+                    self.world_size / running_metrics["current_num_tokens"],
+                    False if self.parallel_dims.tp_enabled else None,
+                )
+
+                if self._clip_grad_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self._model.parameters(),
+                        max_norm=float(self._clip_grad_norm),
+                    )
+                    # If sharded, collect the DTensor here
+                    if isinstance(grad_norm, DTensor):
+                        grad_norm = grad_norm.full_tensor()
+                self._optimizer.step()
+                self._optimizer.zero_grad(set_to_none=True)
+
+        def _inner_train_template_batches(
             batch_idx: int,
             batch: dict[str, torch.Tensor],
             running_metrics: dict[str, torch.Tensor],
+            grads: None = None,  # Not used in this method, but needed for signature consistency
         ) -> dict[str, torch.Tensor]:
             utils.batch_to_device(batch, self._device)
 
@@ -1114,63 +1138,82 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     self._calculate_loss(metrics) * metrics["current_num_tokens"]
                 )
 
-                running_metrics = log_metrics_over_epoch(
-                    metrics,
-                    running_metrics,
-                    self._device,
+                running_metrics = _optimizer_backward(
+                    running_metrics, metrics, current_loss, batch
                 )
 
-                _optimizer_backward(running_metrics, metrics, current_loss)
+            # Perform optimizer step if the gradient accumulation step is reached
+            if (batch_idx + 1) % self._gradient_accumulation_steps == 0:
+                _optimizer_step(batch_idx, running_metrics)
 
-            _optimizer_step(batch_idx, running_metrics)
+            return running_metrics, grads
 
-
-        def _inner_data_batches(
+        def _inner_train_data_batches(
             dataset_batch_idx: int,
-            dataset_batch: dict[str, dict[str, torch.Tensor]],
+            dataset_batch: list[dict[str, torch.Tensor]],
             running_metrics: dict[str, torch.Tensor],
+            grads,
         ) -> dict[str, torch.Tensor]:
-            template_metrics = []
+            template_metrics: list[dict[str, torch.Tensor]] = []
+            grads_per_param = [[] for _ in grads]
 
-            for template_batch_idx, template_batch in enumerate(dataset_batch):
-                templates = template_batch.pop("templates", None)
+            for template_batch in dataset_batch:
+                template_batch.pop("templates", None)
                 utils.batch_to_device(template_batch, self._device)
 
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 with self.context_parallel_manager(list(template_batch.values())):
-                    loss, logits = self._loss_step(template_batch)
+                    loss, __ = self._loss_step(template_batch)
 
-                    metrics = {"loss": loss}
+                    metrics: dict[str, torch.Tensor] = {"loss": loss}
 
                     # Calculate the number of unmasked tokens in the current batch
                     # and increment the total number of tokens seen in the step
                     metrics["current_num_tokens"] = (
                         template_batch["labels"] != self._loss_fn.ignore_index
                     ).sum()
-                    current_loss = (
-                        self._calculate_loss(metrics) * metrics["current_num_tokens"]
-                    )
+                    current_loss = loss * metrics["current_num_tokens"]
 
                     template_metrics.append(metrics)
 
-                    # For optimizer in backward, we need to normalize before calling backward
-                    # This case and gradient accumulation are mutually exclusive
-                    # TODO: Probably not good that we take the running metrics here
-                     _optimizer_backward(running_metrics, metrics, current_loss)
+                    running_metrics = _optimizer_backward(
+                        running_metrics, metrics, current_loss, template_batch
+                    )
+                    grads_per_param = get_gradients(grads_per_param, self._model)
+                    self._optimizer.zero_grad(set_to_none=True)
 
             dataset_metrics = calculate_custom_data_batch_losses(template_metrics)
+            grads = self.aggregate(grads_per_param, grads)
 
-            _optimizer_step(batch_idx, running_metrics)
+            if (dataset_batch_idx + 1) % self._gradient_accumulation_steps == 0:
+                with torch.no_grad():
+                    for parameter, grad in zip(self._model.parameters(), grads):
+                        if parameter.requires_grad:
+                            parameter.grad = (
+                                None if grad is None else grad.to(parameter.device)
+                            )
 
-            return log_metrics_over_epoch(
-                metrics,
-                running_metrics,
-                self._device,
+                grads = [torch.zeros_like(p) for p in self._model.parameters()]
+
+                # TODO: Probably not good that we take the running metrics here
+                # Perform optimizer step if the gradient accumulation step is reached
+                _optimizer_step(running_metrics)
+
+            return (
+                log_metrics_over_epoch(
+                    dataset_metrics,
+                    running_metrics,
+                    self._device,
+                ),
+                grads,
             )
 
-        return _inner_data_batches if self.is_data_batches else _inner_template_batches
-
+        return (
+            _inner_train_data_batches
+            if self.is_data_batches
+            else _inner_train_template_batches
+        )
 
     def train(self) -> None:
         """
@@ -1190,13 +1233,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         t0 = time.perf_counter()
         running_metrics = {}
 
+        grads = [torch.zeros_like(p) for p in self._model.parameters()]
+
         self._profiler.start()
         # Validate before training starts
-        if (
-            self._run_val_every_n_steps is not None
-            and self.global_step % self._run_val_every_n_steps == 0
-        ):
-            self.validate()
+        # if (
+        #     self._run_val_every_n_steps is not None
+        #     and self.global_step % self._run_val_every_n_steps == 0
+        # ):
+        #     self.validate()
 
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
@@ -1212,8 +1257,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     torch.cuda.memory._record_memory_history()
 
-                    running_metrics = self.inner_validate(batch_idx, batch, running_metrics)
+                running_metrics, grads = self.inner_train(
+                    idx, batch, running_metrics, grads
+                )
 
+                if (idx + 1) % self._gradient_accumulation_steps == 0:
                     # Update the number of steps when the weights are updated
                     self.global_step += 1
 
@@ -1267,6 +1315,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 training.get_memory_stats(device=self._device)
                             )
                         if self._clip_grad_norm is not None:
+                            grad_norm = None  # TODO:
                             log_dict.update({"grad_norm": grad_norm})
                         self._metric_logger.log_dict(
                             log_dict,

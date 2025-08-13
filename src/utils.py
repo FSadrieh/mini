@@ -30,22 +30,22 @@ def calculate_custom_losses(
     per_example_loss = per_token_loss.sum(dim=1) / labels.ne(-100).sum(dim=1).float()
     per_group_loss = torch.split(per_example_loss, sample_count)
     return {
-        "distance": sum(
+        "distance": torch.Tensor(sum(
             torch.abs(max(losses) - min(losses)) for losses in per_group_loss
         )
-        / len(per_group_loss),
-        "variance": sum(torch.var(losses, unbiased=False) for losses in per_group_loss)
-        / len(per_group_loss),
-        "sum": sum(losses.sum() for losses in per_group_loss) / len(per_group_loss),
-        "mean": total_mean_loss,
+        / len(per_group_loss)),
+        "variance": torch.Tensor(sum(torch.var(losses, unbiased=False) for losses in per_group_loss)
+        / len(per_group_loss)),
+        "sum": torch.Tensor(sum(losses.sum() for losses in per_group_loss) / len(per_group_loss)),
+        "mean": torch.Tensor(total_mean_loss),
     }
 
 
 def calculate_custom_data_batch_losses(
-    metrics: dict[str, torch.Tensor],
+    metrics: list[dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
     losses = torch.stack([metric["loss"] for metric in metrics])
-    current_num_tokens = sum(metric["current_num_tokens"] for metric in metrics)
+    current_num_tokens = torch.Tensor(sum(metric["current_num_tokens"] for metric in metrics))
     return {
         "distance": torch.abs(torch.max(losses) - torch.min(losses)),
         "variance": torch.var(losses, unbiased=False),
@@ -73,10 +73,10 @@ def get_calculate_loss(loss_type: str):
 
 
 def log_metrics_over_epoch(
-    new_metrics: dict[str, float],
-    running_metrics: dict[str, float],
+    new_metrics: dict[str, torch.Tensor],
+    running_metrics: dict[str, torch.Tensor],
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, torch.Tensor]:
     for key, value in new_metrics.items():
         if key not in running_metrics:
             running_metrics[key] = torch.tensor(0.0, device=device)
@@ -90,7 +90,7 @@ def log_metrics_over_epoch(
     return running_metrics
 
 
-def calculate_total_metrics(metrics: dict[str, float]) -> dict[str, float]:
+def calculate_total_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     total_metrics = {}
     for key, value in metrics.items():
         if key == "current_num_tokens":
@@ -210,3 +210,37 @@ def get_em_per_prompt(
             em_per_prompt[prompt_id] = []
         em_per_prompt[prompt_id].append(metric.compute()["exact_match"].item())
     return em_per_prompt
+
+
+def get_gradient_aggregation(
+    gradient_aggregation_type: str,
+):
+    """
+    Provides the gradient aggregation function with different aggregations based on the gradient_aggregation_type.
+    """
+
+    def mean_aggregation(grad_list):
+        return torch.stack(grad_list).mean(dim=0)
+
+    if gradient_aggregation_type == "mean":
+        _aggregate = mean_aggregation
+    else:
+        raise ValueError(
+            f"Unknown gradient aggregation method: {gradient_aggregation_type}. Supported methods are 'mean'."
+        )
+
+    def aggregate(per_param_lists, grads: list[torch.Tensor]) -> list[torch.Tensor]:
+        for i, grad_list in enumerate(per_param_lists):
+            if grad_list:
+                agg = _aggregate(grad_list)
+                grads[i].add_(agg)
+        return grads
+
+    return aggregate
+
+
+def get_gradients(per_param_lists, model):
+    for i, p in enumerate(model.parameters()):
+        if p.grad is not None:
+            per_param_lists[i].append(p.grad.detach().clone())
+    return per_param_lists
