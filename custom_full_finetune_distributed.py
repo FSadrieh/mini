@@ -334,7 +334,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         self.current_checkpoint_dir = cfg.checkpointer.checkpoint_dir
 
-        self.sanity_check = cfg.sanity_check
+        self.sanity_check_generation = cfg.sanity_check_generation
         self.is_data_batches = cfg.dataset.data_mode == "data_batches"
         self.inner_validate = self.get_inner_validate()
         self.inner_train = self.get_inner_train()
@@ -511,6 +511,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             "seed": cfg.get("seed", self.seed),
             "data_location": cfg.dataset.get("data_location", "data"),
             "preprocessing_workers": cfg.dataset.get("preprocessing_workers", 1),
+            "sanity_check_dataloading": cfg.get("sanity_check_dataloading", False),
         }
 
         data_config["val_batch_size"] = cfg.get("batch_size_val", cfg.batch_size)
@@ -1113,7 +1114,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             batch: dict[str, torch.Tensor],
             running_metrics: dict[str, torch.Tensor],
             grads: None = None,  # Not used in this method, but needed for signature consistency
-        ) -> dict[str, torch.Tensor]:
+        ) -> tuple[dict[str, torch.Tensor], None]:
+            templates = batch.pop("templates", None)
             utils.batch_to_device(batch, self._device)
 
             # Loss is normalized by default so we multiply by the number of tokens
@@ -1144,7 +1146,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
             # Perform optimizer step if the gradient accumulation step is reached
             if (batch_idx + 1) % self._gradient_accumulation_steps == 0:
-                _optimizer_step(batch_idx, running_metrics)
+                _optimizer_step(running_metrics)
 
             return running_metrics, grads
 
@@ -1153,7 +1155,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             dataset_batch: list[dict[str, torch.Tensor]],
             running_metrics: dict[str, torch.Tensor],
             grads,
-        ) -> dict[str, torch.Tensor]:
+        ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
             template_metrics: list[dict[str, torch.Tensor]] = []
             grads_per_param = [[] for _ in grads]
 
@@ -1164,7 +1166,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Loss is normalized by default so we multiply by the number of tokens
                 # This way we can normalize by the total number of tokens if we're accumulating gradients
                 with self.context_parallel_manager(list(template_batch.values())):
-                    loss, __ = self._loss_step(template_batch)
+                    loss = self._loss_step(template_batch)[0]
 
                     metrics: dict[str, torch.Tensor] = {"loss": loss}
 
@@ -1196,18 +1198,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 grads = [torch.zeros_like(p) for p in self._model.parameters()]
 
-                # TODO: Probably not good that we take the running metrics here
-                # Perform optimizer step if the gradient accumulation step is reached
                 _optimizer_step(running_metrics)
 
-            return (
-                log_metrics_over_epoch(
-                    dataset_metrics,
-                    running_metrics,
-                    self._device,
-                ),
-                grads,
-            )
+            return running_metrics, grads
 
         return (
             _inner_train_data_batches
@@ -1237,11 +1230,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._profiler.start()
         # Validate before training starts
-        # if (
-        #     self._run_val_every_n_steps is not None
-        #     and self.global_step % self._run_val_every_n_steps == 0
-        # ):
-        #     self.validate()
+        if (
+            self._run_val_every_n_steps is not None
+            and self.global_step % self._run_val_every_n_steps == 0
+        ):
+            self.validate()
 
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
@@ -1293,10 +1286,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
                             "train/loss": total_metrics["loss"],
-                            "train/mean_loss": total_metrics["mean"],
-                            "train/sum_loss": total_metrics["sum"],
-                            "train/distance_loss": total_metrics["distance"],
-                            "train/var_loss": total_metrics["variance"],
                             "lr": get_lr(
                                 (
                                     self._optimizer
@@ -1310,6 +1299,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             )
                             / (time_per_step * self.world_size),
                         }
+                        for key, value in total_metrics.items():
+                            if key not in ["current_num_tokens", "loss"]:
+                                log_dict[f"train/{key}_loss"] = value
                         if self._log_peak_memory_stats:
                             log_dict.update(
                                 training.get_memory_stats(device=self._device)
@@ -1418,7 +1410,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             batch_idx == 0 and not self.is_data_batches
         ):  # TODO: Currently only supported with data_mode template_batches
             # Takes some time so should be used sparingly
-            if self.sanity_check:
+            if self.sanity_check_generation:
                 make_sanity_check(
                     prompts,
                     attention_mask,

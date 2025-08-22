@@ -13,6 +13,8 @@ from print_on_steroids import logger
 from transformers import PreTrainedTokenizerFast
 from torchtune.data import Message, Role
 
+from src.sanity_check_classes import validate_template_batches, validate_data_batches
+
 T0_HELDOUT_TASKS = ["copa", "hellaswag", "cb", "rte", "wsc", "winogrande", "wic"]
 
 BAD_TASKS = [
@@ -85,6 +87,7 @@ class CustomDataLoader:
         data_location: str,
         preprocessing_workers: int,
         val_batch_size: int = None,
+        sanity_check_dataloading: bool = False,
     ):
         super().__init__()
 
@@ -104,6 +107,8 @@ class CustomDataLoader:
         self.loader = PromptLoader(
             tokenizer, seed, self.tokenized_data_path, data_mode, firstn_datasets
         )
+
+        self.sanity_check_dataloading = sanity_check_dataloading
 
     def load_dataset(self, split: str) -> None:
         try:
@@ -150,24 +155,27 @@ class CustomDataLoader:
 
     def get_collator(self):
 
-        def _collate(batch: dict[str, list[list[int|str]]]) -> dict[str, torch.Tensor]:
-            if "templates" in batch:
-                templates = batch.pop("templates")
-                collated_batch = {k: torch.tensor(v) for k, v in batch.items()}
-                collated_batch["templates"] = templates
-                return collated_batch
-            return {k: torch.tensor(v) for k, v in batch.items()}
+        def _collate(batch: dict[str, list[list[int|str]]]) -> dict[str, torch.Tensor | list[str]]:
+            templates: list[str] = batch.pop("templates")
+            collated_batch: dict[str, torch.Tensor | list[str]] = {k: torch.tensor(v) for k, v in batch.items()}
+            collated_batch["templates"] = templates
+            return collated_batch
 
-        def collate_default(examples: tuple[dict[str, dict[str, list[list[int|str]]]]]) -> dict[str, torch.Tensor]:
-            return _collate(examples[0]["batches"])
+        def collate_with_template_batches(examples: list[dict[str, dict[str, list[list[int|str]]]]]) -> dict[str, torch.Tensor | list[str]]:
+            batch = _collate(examples[0]["batches"])
+            if self.sanity_check_dataloading:
+                validate_template_batches(batch, self.batch_size, self.val_batch_size)
+            return batch
 
-        def collate_with_data_batches(examples: tuple[dict[str, list[dict[str, list[list[int|str]]]]]]) -> list[dict[str, torch.Tensor]]:
+        def collate_with_data_batches(examples: tuple[dict[str, list[dict[str, list[list[int|str]]]]]]) -> list[dict[str, torch.Tensor | str]]:
             collated_batch = []
             for example in examples[0]['batches']:
                 collated_batch.append(_collate(example))
+            if self.sanity_check_dataloading:
+                validate_data_batches(collated_batch, self.batch_size, self.val_batch_size)
             return collated_batch
 
-        return collate_default if self.data_mode == "default" else collate_with_data_batches
+        return collate_with_template_batches if self.data_mode == "template_batches" else collate_with_data_batches
 
 
 def make_tokenize_function(tokenizer: PreTrainedTokenizerFast):
@@ -277,10 +285,10 @@ def make_preprocess_function(
             batch["sample_count"] = batch_counter
         return batch
 
-    def default_preprocess_function(examples):
+    def template_batch_preprocess_function(examples):
         """
         The input examples are lists of the tokens, prompts and templates for each sample (That means each sample gets one list with all examples for this sample).
-        The goal for default preprocessing is to ensure that in each batch we have all examples for a given sample.
+        The goal for template_batch preprocessing is to ensure that in each batch we have all examples for a given sample.
         We do this by greedily filling the batch until the next sample would not fit.
         Mixing datasets in a batch is ensured, by having the examples shuffled, prior to this function.
         """
@@ -306,11 +314,11 @@ def make_preprocess_function(
             if len(batch_tokens) + len(sample_tokens) > batch_size:
                 batches.append(
                     _flush_batch(
-                        batch_tokens,
-                        batch_prompt,
-                        batch_generation_label,
-                        batch_counter,
-                        batch_templates,
+                        batch_tokens=batch_tokens,
+                        batch_prompt=batch_prompt,
+                        batch_generation_label=batch_generation_label,
+                        batch_templates=batch_templates,
+                        batch_counter=batch_counter,
                     )
                 )
                 # Reset everything for the next batch
@@ -366,10 +374,10 @@ def make_preprocess_function(
                 data_batches.append(
                     [
                         _flush_batch(
-                            template_batch["batch_tokens"],
-                            template_batch["batch_prompt"],
-                            template_batch["batch_generation_label"],
-                            [template_name] * len(template_batch["batch_tokens"]),
+                            batch_tokens=template_batch["batch_tokens"],
+                            batch_prompt=template_batch["batch_prompt"],
+                            batch_generation_label=template_batch["batch_generation_label"],
+                            batch_templates=[template_name] * len(template_batch["batch_tokens"]),
                         )
                         # We match each template_batch with its template_name
                         for template_batch, template_name in zip(
@@ -407,12 +415,12 @@ def make_preprocess_function(
 
         return {"batches": data_batches}
 
-    if data_mode == "default":
-        return default_preprocess_function
+    if data_mode == "template_batches":
+        return template_batch_preprocess_function
     if data_mode == "data_batches":
         return data_batch_preprocess_function
     raise ValueError(
-        f"Unknown data mode {data_mode}. Please use 'default' or 'data_batches'."
+        f"Unknown data mode {data_mode}. Please use 'template_batch' or 'data_batches'."
     )
 
 
@@ -491,7 +499,7 @@ class PromptLoader:
         # We merge all datasets, shuffle them and save them to disk
         full_dataset = datasets.concatenate_datasets(dataset_list)
         del dataset_list
-        if self.data_mode == "default":
+        if self.data_mode == "template_batches":
             full_dataset = full_dataset.shuffle(seed=self.seed)
         full_dataset.save_to_disk(os.path.join(self.tokenized_data_path, split))
         return full_dataset
@@ -509,7 +517,7 @@ class PromptLoader:
             and dataset_id in T0_HELDOUT_TASKS
             or split != "train"
             and dataset_id not in T0_HELDOUT_TASKS
-            or (dataset_id, subset) not in self.debug_tasks  # TODO:
+            or dataset_id not in self.more_tasks
         ):
             return False, None
         # We first try to load the dataset from disk if we have tokenized it before
@@ -550,10 +558,9 @@ class PromptLoader:
                     self.tokenizer({"messages": messages}, inference=True)["tokens"]
                 )
                 messages[1] = Message(role="assistant", content=label)
-                tokens = self.tokenizer({"messages": messages}, inference=False)[
+                example_tokens.append(self.tokenizer({"messages": messages}, inference=False)[
                     "tokens"
-                ]
-                example_tokens.append(tokens)
+                ])
                 template_ids.append(template_id)
 
             sample_tokens.append(example_tokens)
