@@ -2,7 +2,10 @@ import torch
 
 
 def validate_template_batches(
-    batch: dict[str, torch.Tensor | list[str]], train_max_batch_size: int, val_max_batch_size: int
+    batch: dict[str, torch.Tensor | list[str]],
+    train_max_batch_size: int,
+    val_max_batch_size: int,
+    split: str,
 ):
     """The idea of a template_batch is to pack all prompts for a sample into a single batch and then pack the batches with as many samples as possible.
     A valid template batch is a dictionary with the following keys:
@@ -19,11 +22,16 @@ def validate_template_batches(
     2. Validate batch lengths
     3. Validate individual contents of the batch
     """
-    _validate_basic_batch(batch, train_max_batch_size, val_max_batch_size, is_template_batch=True)
+    _validate_basic_batch(
+        batch, train_max_batch_size, val_max_batch_size, is_template_batch=True, split=split
+    )
 
 
 def validate_data_batches(
-    batches: list[dict[str, torch.Tensor | list[str]]], train_batch_size: int, val_batch_size: int
+    batches: list[dict[str, torch.Tensor | list[str]]],
+    train_batch_size: int,
+    val_batch_size: int,
+    split: str,
 ):
     """The idea of a data_batch is to have a list of batches. In each of the batches we have only one template for different samples. Over all batches in the list we have all templates.
     A valid template batch is a list of dictionaries with the following keys:
@@ -42,9 +50,10 @@ def validate_data_batches(
     ### ASSERT GENERAL STRUCTURE ###
     assert isinstance(batches, list), f"batch should be a dict, but got {type(batches)}"
 
-    batch_size = -1
     for batch in batches:
-        _validate_basic_batch(batch, train_batch_size, val_batch_size, is_template_batch=False)
+        _validate_basic_batch(
+            batch, train_batch_size, val_batch_size, is_template_batch=False, split=split
+        )
 
 
 def _validate_basic_batch(
@@ -52,6 +61,7 @@ def _validate_basic_batch(
     train_max_batch_size: int,
     val_max_batch_size: int,
     is_template_batch: bool,
+    split: str,
 ):
     """Function to validate the basics of a batch, either template or data batch. Used to prevent code duplication."""
     ### ASSERT GENERAL STRUCTURE ###
@@ -89,21 +99,19 @@ def _validate_basic_batch(
                         item.shape[0] == batch_size
                     ), f"All tensors in 'batch' should have the same length (except sample_count), but got {len(item)} for key '{key}'"
 
-    if is_template_batch:
         # Since we pack samples into a batch, the batch size can vary, but it should never be bigger than the max_batch_size
         # Since train and val batch size could be different we need to check both (Not perfect)
         assert (
-            0 < batch_size <= train_max_batch_size or batch_size <= val_max_batch_size
+            0 < batch_size <= train_max_batch_size
+            and split == "train"
+            or 0 < batch_size <= val_max_batch_size
+            and split == "validation"
         ), f"Batch size must be greater than 0 and less than or equal to max_batch_size: for train: {train_max_batch_size} or for val {val_max_batch_size}, but got {batch_size}"
         # The sample count tells you how many examples are in the batch per sample, so the sum of the sample_count should equal the batch size
-        assert (
-            sum(batch["sample_count"]) == batch_size
-        ), f"Sum of sample_count {sum(batch['sample_count'])} must equal batch size {batch_size}"
-    else:
-        # For data batches we need to meet the batch size exactly
-        assert (
-            batch_size == train_max_batch_size or batch_size == val_max_batch_size
-        ), f"Batch size must equal max_batch_size: for train: {train_max_batch_size} or for val {val_max_batch_size}, but got {batch_size}"
+        if is_template_batch:
+            assert (
+                sum(batch["sample_count"]) == batch_size
+            ), f"Sum of sample_count {sum(batch['sample_count'])} must equal batch size {batch_size}"
 
     assert (
         len(batch["templates"]) == batch_size

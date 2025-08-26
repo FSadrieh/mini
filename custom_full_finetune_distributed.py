@@ -505,7 +505,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         data_config = {
             "tokenizer": self._tokenizer,
             "tokenizer_name": tokenizer_name,
-            "data_mode": cfg.dataset["data_mode"],
+            "train_data_mode": cfg.dataset["data_mode"],
             "batch_size": cfg.batch_size,
             "firstn_datasets": cfg.dataset.get("firstn_datasets", None),
             "seed": cfg.get("seed", self.seed),
@@ -862,7 +862,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         it is loaded into the dataloader.
         """
         dataset = data_loader.load_dataset(split=split)
-        collate = data_loader.get_collator()
+        collate = data_loader.get_collator(split=split)
         dataloader = StatefulDataLoader(
             dataset=dataset,
             batch_size=1,
@@ -895,94 +895,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         del outputs
         return loss, logits
 
-    def get_inner_validate(self) -> dict[str, float]:
-        """
-        Returns the handling for a single validation batch depending if they are:
-        - template_batches (all templates for one sample are in the batch)
-        - data_batches (a batch contains a batch for each template, these inner batches contain only one template for multiple examples)
-        """
-
-        def _get_additional_metrics(
-            metrics: dict[str, float],
-            batch: dict[str, torch.Tensor],
-            batch_idx: int,
-            logits: torch.Tensor,
-            templates: list[str],
-        ) -> dict[str, float]:
-            metrics["current_num_tokens"] = (
-                batch["labels"] != self._loss_fn.ignore_index
-            ).sum()
-
-            self.ppl.update(
-                logits,
-                batch["labels"],
-            )
-            predictions = torch.argmax(logits, axis=-1).view(-1)
-            mask = batch["labels"].view(-1).ne(-100)
-            self.acc.update(
-                preds=predictions[mask],
-                target=batch["labels"].view(-1)[mask],
-            )
-
-            self.generate(batch, templates, batch_idx)
-
-            return metrics
-
-        def _inner_validate_template_batches(
-            batch_idx: int,
-            batch: dict[str, torch.Tensor],
-            running_metrics: dict[str, torch.Tensor],
-        ) -> dict[str, torch.Tensor]:
-            templates = batch.pop("templates", None)
-            utils.batch_to_device(batch, self._device)
-
-            # Compute loss
-            loss, logits = self._loss_step(batch)
-
-            metrics = calculate_custom_losses(
-                self.custom_loss,
-                logits,
-                batch["labels"],
-                batch["sample_count"].tolist(),
-            )
-            metrics["loss"] = loss
-
-            metrics = _get_additional_metrics(
-                metrics, batch, batch_idx, logits, templates
-            )
-
-            return log_metrics_over_epoch(metrics, running_metrics, self._device)
-
-        def _inner_validate_data_batches(
-            dataset_batch_idx: int,
-            dataset_batch: dict[str, dict[str, torch.Tensor]],
-            running_metrics: dict[str, torch.Tensor],
-        ) -> dict[str, torch.Tensor]:
-            template_metrics = []
-
-            for template_batch_idx, template_batch in enumerate(dataset_batch):
-                templates = template_batch.pop("templates", None)
-                utils.batch_to_device(template_batch, self._device)
-
-                # Compute loss
-                loss, logits = self._loss_step(template_batch)
-                metrics = {"loss": loss}
-                metrics = _get_additional_metrics(
-                    metrics, template_batch, template_batch_idx, logits, templates
-                )
-                template_metrics.append(metrics)
-
-            dataset_metrics = calculate_custom_data_batch_losses(template_metrics)
-            return log_metrics_over_epoch(
-                dataset_metrics, running_metrics, self._device
-            )
-
-        return (
-            _inner_validate_data_batches
-            if self.is_data_batches
-            else _inner_validate_template_batches
-        )
-
     def validate(self) -> dict[str, float]:
         """
         Run validation loop and return average validation loss.
@@ -993,7 +905,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         running_metrics = {}
         self.em_per_prompt = {}
 
-        self.generator.setup(  # TODO: SEE ERROR_AVR.TXT
+        self.generator.setup(  # TODO: SEE ERROR_AVR.TXT??
             self.current_checkpoint_dir,
             self._tokenizer.pad_id,
             [self._tokenizer.eos_id, self._tokenizer.special_tokens["<|eot_id|>"]],
@@ -1009,7 +921,40 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if batch_idx >= self._eval_batches and self._eval_batches > 0:
                     break
 
-                running_metrics = self.inner_validate(batch_idx, batch, running_metrics)
+                templates = batch.pop("templates", None)
+                utils.batch_to_device(batch, self._device)
+
+                loss, logits = self._loss_step(batch)
+
+                metrics = calculate_custom_losses(
+                    self.custom_loss,
+                    logits,
+                    batch["labels"],
+                    batch["sample_count"].tolist(),
+                )
+
+                metrics["loss"] = loss
+
+                metrics["current_num_tokens"] = (
+                    batch["labels"] != self._loss_fn.ignore_index
+                ).sum()
+
+                self.ppl.update(
+                    logits,
+                    batch["labels"],
+                )
+                predictions = torch.argmax(logits, axis=-1).view(-1)
+                mask = batch["labels"].view(-1).ne(-100)
+                self.acc.update(
+                    preds=predictions[mask],
+                    target=batch["labels"].view(-1)[mask],
+                )
+
+                self.generate(batch, templates, batch_idx)
+
+                running_metrics = log_metrics_over_epoch(
+                    metrics, running_metrics, self._device
+                )
 
         # Aggregate validation metrics across all ranks
         metrics = calculate_total_metrics(running_metrics)
@@ -1406,9 +1351,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self.bleu.update(preds=[pred], target=[[label_text[i]]])
         self.rouge.update(preds=pred_text, target=label_text)
 
-        if (
-            batch_idx == 0 and not self.is_data_batches
-        ):  # TODO: Currently only supported with data_mode template_batches
+        if batch_idx == 0:
             # Takes some time so should be used sparingly
             if self.sanity_check_generation:
                 make_sanity_check(

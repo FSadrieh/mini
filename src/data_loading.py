@@ -80,7 +80,7 @@ class CustomDataLoader:
         self,
         tokenizer: PreTrainedTokenizerFast,
         tokenizer_name: str,
-        data_mode: str,
+        train_data_mode: str,
         batch_size: int,
         firstn_datasets: int,  # set for 0 when using all datasets
         seed: int,
@@ -93,7 +93,10 @@ class CustomDataLoader:
 
         self.tokenizer = tokenizer
         self.tokenizer_name = tokenizer_name.replace("/", "_")
-        self.data_mode = data_mode
+        self.train_data_mode = train_data_mode
+        # To keep the validation comparable we always use template batches for validation
+        self.val_data_mode = "template_batches"
+        self.data_mode = None
 
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size
@@ -102,25 +105,40 @@ class CustomDataLoader:
         self.preprocessing_workers = preprocessing_workers
         self.seed = seed
 
-        self.tokenized_data_path = f"{data_location}/tokenized_{self.tokenizer_name}_{self.data_mode}_{firstn_datasets}"
-
-        self.loader = PromptLoader(
-            tokenizer, seed, self.tokenized_data_path, data_mode, firstn_datasets
-        )
+        self.loader = None
 
         self.sanity_check_dataloading = sanity_check_dataloading
 
     def load_dataset(self, split: str) -> None:
+        self.data_mode = (
+            self.train_data_mode if split == "train" else self.val_data_mode
+        )
         try:
             dataset = load_from_disk(self.processed_data_path(split))
             logger.info("Data already prepared, skipping preparation.")
         except Exception:
+            self.loader = PromptLoader(
+                self.tokenizer,
+                self.seed,
+                self.tokenized_data_path(),
+                self.data_mode,
+                self.firstn_datasets,
+            )
             dataset = self.preprocess_data(split)
             logger.info("Data not prepared, preparing data.")
-
         return dataset
 
+    def tokenized_data_path(self) -> str:
+        """Creates the path for the tokenized data"""
+        assert (
+            self.data_mode is not None
+        ), "Data mode is not set. Please load a dataset first."
+        return f"{self.data_location}/tokenized_{self.tokenizer_name}_{self.data_mode}_{self.firstn_datasets}"
+
     def processed_data_path(self, split: str) -> str:
+        assert (
+            self.data_mode is not None
+        ), "Data mode is not set. Please load a dataset first."
         base_path = f"{self.data_location}/processed_{self.tokenizer_name}_{self.data_mode}_{self.firstn_datasets}"
         batch_size = self.batch_size if split == "train" else self.val_batch_size
         return os.path.join(f"{base_path}_{batch_size}", split)
@@ -130,7 +148,7 @@ class CustomDataLoader:
             os.makedirs(self.processed_data_path(split), exist_ok=True)
 
         try:
-            dataset = Dataset.load_from_disk(self.tokenized_data_path + f"/{split}/")
+            dataset = Dataset.load_from_disk(self.tokenized_data_path() + f"/{split}/")
         except OSError:
             logger.info(f"Creating tokenized dataset for {split}...")
             dataset = self.loader.iterate_prompts(split=split)
@@ -153,29 +171,45 @@ class CustomDataLoader:
         logger.info(f"Saved {split} dataset to {self.processed_data_path(split)}")
         return dataset
 
-    def get_collator(self):
+    def get_collator(self, split: str):
 
-        def _collate(batch: dict[str, list[list[int|str]]]) -> dict[str, torch.Tensor | list[str]]:
+        def _collate(
+            batch: dict[str, list[list[int | str]]],
+        ) -> dict[str, torch.Tensor | list[str]]:
             templates: list[str] = batch.pop("templates")
-            collated_batch: dict[str, torch.Tensor | list[str]] = {k: torch.tensor(v) for k, v in batch.items()}
+            collated_batch: dict[str, torch.Tensor | list[str]] = {
+                k: torch.tensor(v) for k, v in batch.items()
+            }
             collated_batch["templates"] = templates
             return collated_batch
 
-        def collate_with_template_batches(examples: list[dict[str, dict[str, list[list[int|str]]]]]) -> dict[str, torch.Tensor | list[str]]:
+        def collate_with_template_batches(
+            examples: list[dict[str, dict[str, list[list[int | str]]]]],
+        ) -> dict[str, torch.Tensor | list[str]]:
             batch = _collate(examples[0]["batches"])
             if self.sanity_check_dataloading:
-                validate_template_batches(batch, self.batch_size, self.val_batch_size)
+                validate_template_batches(
+                    batch, self.batch_size, self.val_batch_size, split
+                )
             return batch
 
-        def collate_with_data_batches(examples: tuple[dict[str, list[dict[str, list[list[int|str]]]]]]) -> list[dict[str, torch.Tensor | str]]:
+        def collate_with_data_batches(
+            examples: tuple[dict[str, list[dict[str, list[list[int | str]]]]]],
+        ) -> list[dict[str, torch.Tensor | str]]:
             collated_batch = []
-            for example in examples[0]['batches']:
+            for example in examples[0]["batches"]:
                 collated_batch.append(_collate(example))
             if self.sanity_check_dataloading:
-                validate_data_batches(collated_batch, self.batch_size, self.val_batch_size)
+                validate_data_batches(
+                    collated_batch, self.batch_size, self.val_batch_size, split
+                )
             return collated_batch
 
-        return collate_with_template_batches if self.data_mode == "template_batches" else collate_with_data_batches
+        return (
+            collate_with_template_batches
+            if self.data_mode == "template_batches" or split != "train"
+            else collate_with_data_batches
+        )
 
 
 def make_tokenize_function(tokenizer: PreTrainedTokenizerFast):
@@ -376,8 +410,11 @@ def make_preprocess_function(
                         _flush_batch(
                             batch_tokens=template_batch["batch_tokens"],
                             batch_prompt=template_batch["batch_prompt"],
-                            batch_generation_label=template_batch["batch_generation_label"],
-                            batch_templates=[template_name] * len(template_batch["batch_tokens"]),
+                            batch_generation_label=template_batch[
+                                "batch_generation_label"
+                            ],
+                            batch_templates=[template_name]
+                            * len(template_batch["batch_tokens"]),
                         )
                         # We match each template_batch with its template_name
                         for template_batch, template_name in zip(
@@ -558,9 +595,9 @@ class PromptLoader:
                     self.tokenizer({"messages": messages}, inference=True)["tokens"]
                 )
                 messages[1] = Message(role="assistant", content=label)
-                example_tokens.append(self.tokenizer({"messages": messages}, inference=False)[
-                    "tokens"
-                ])
+                example_tokens.append(
+                    self.tokenizer({"messages": messages}, inference=False)["tokens"]
+                )
                 template_ids.append(template_id)
 
             sample_tokens.append(example_tokens)
